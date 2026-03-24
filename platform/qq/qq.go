@@ -372,6 +372,41 @@ func (p *Platform) SendImage(ctx context.Context, replyCtx any, img core.ImageAt
 	return nil
 }
 
+// SendFile sends a file to the conversation.
+// Implements core.FileSender.
+func (p *Platform) SendFile(ctx context.Context, replyCtx any, file core.FileAttachment) error {
+	rctx, ok := replyCtx.(*replyContext)
+	if !ok {
+		return fmt.Errorf("qq: SendFile: invalid reply context type %T", replyCtx)
+	}
+
+	b64 := base64.StdEncoding.EncodeToString(file.Data)
+	// Use file segment with base64 encoded data
+	segments := []map[string]any{
+		{"type": "file", "data": map[string]any{"file": "base64://" + b64, "name": file.FileName}},
+	}
+
+	params := map[string]any{
+		"message": segments,
+	}
+
+	if rctx.messageType == "group" {
+		params["group_id"] = rctx.groupID
+		_, err := p.callAPI("send_group_msg", params)
+		if err != nil {
+			return fmt.Errorf("qq: send file: %w", err)
+		}
+		return nil
+	}
+
+	params["user_id"] = rctx.userID
+	_, err := p.callAPI("send_private_msg", params)
+	if err != nil {
+		return fmt.Errorf("qq: send file: %w", err)
+	}
+	return nil
+}
+
 var _ core.ImageSender = (*Platform)(nil)
 
 func (p *Platform) Stop() error {

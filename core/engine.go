@@ -2716,6 +2716,8 @@ var builtinCommands = []struct {
 	{[]string{"search", "find"}, "search"},
 	{[]string{"shell", "sh", "exec", "run"}, "shell"},
 	{[]string{"dir", "cd", "chdir", "workdir"}, "dir"},
+	{[]string{"ls", "files"}, "ls"},
+	{[]string{"fget", "fg", "fileget"}, "fget"},
 	{[]string{"tts"}, "tts"},
 	{[]string{"workspace", "ws"}, "workspace"},
 	{[]string{"whoami", "myid"}, "whoami"},
@@ -2902,6 +2904,10 @@ func (e *Engine) handleCommand(p Platform, msg *Message, raw string) bool {
 		e.cmdShell(p, msg, raw)
 	case "dir":
 		e.cmdDir(p, msg, args)
+	case "ls":
+		e.cmdLs(p, msg, args)
+	case "fget":
+		e.cmdFget(p, msg, args)
 	case "tts":
 		e.cmdTTS(p, msg, args)
 	case "workspace":
@@ -3606,6 +3612,156 @@ func (e *Engine) cmdDir(p Platform, msg *Message, args []string) {
 		return
 	}
 	e.reply(p, msg.ReplyCtx, successMsg)
+}
+
+// cmdLs lists files in the current working directory.
+// Usage: /ls [path]
+func (e *Engine) cmdLs(p Platform, msg *Message, args []string) {
+	agent, _, _, err := e.commandContext(p, msg)
+	if err != nil {
+		e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgWsResolutionError, err))
+		return
+	}
+	switcher, ok := agent.(WorkDirSwitcher)
+	if !ok {
+		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgDirNotSupported))
+		return
+	}
+
+	currentDir := switcher.GetWorkDir()
+	targetDir := currentDir
+
+	if len(args) > 0 {
+		targetDir = filepath.Join(currentDir, strings.Join(args, " "))
+	}
+
+	entries, err := os.ReadDir(targetDir)
+	if err != nil {
+		e.reply(p, msg.ReplyCtx, fmt.Sprintf("Error reading directory: %v", err))
+		return
+	}
+
+	var sb strings.Builder
+	if targetDir != currentDir {
+		sb.WriteString(fmt.Sprintf("📁 %s\n\n", targetDir))
+	}
+
+	fileCount := 0
+	dirCount := 0
+
+	for _, entry := range entries {
+		if entry.IsDir() {
+			dirCount++
+			sb.WriteString(fmt.Sprintf("📂 %s/\n", entry.Name()))
+		} else {
+			fileCount++
+			sb.WriteString(fmt.Sprintf("📄 %s\n", entry.Name()))
+		}
+	}
+
+	sb.WriteString(fmt.Sprintf("\n%d files, %d directories", fileCount, dirCount))
+	e.reply(p, msg.ReplyCtx, sb.String())
+}
+
+// cmdFget sends a file from the current working directory to the user.
+// Usage: /fget <filename>
+func (e *Engine) cmdFget(p Platform, msg *Message, args []string) {
+	if len(args) == 0 {
+		e.reply(p, msg.ReplyCtx, "Usage: /fget <filename>\nExample: /fget REVIEW_1d15eff.md")
+		return
+	}
+
+	// Check if platform supports file sending
+	fileSender, ok := p.(FileSender)
+	if !ok {
+		e.reply(p, msg.ReplyCtx, fmt.Sprintf("Platform %s does not support file sending", p.Name()))
+		return
+	}
+
+	// Get current working directory
+	agent, _, _, err := e.commandContext(p, msg)
+	if err != nil {
+		e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgWsResolutionError, err))
+		return
+	}
+	switcher, ok := agent.(WorkDirSwitcher)
+	if !ok {
+		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgDirNotSupported))
+		return
+	}
+
+	currentDir := switcher.GetWorkDir()
+	fileName := strings.Join(args, " ")
+	filePath := filepath.Join(currentDir, fileName)
+
+	// Read file content
+	data, err := os.ReadFile(filePath)
+	if err != nil {
+		e.reply(p, msg.ReplyCtx, fmt.Sprintf("Error reading file: %v", err))
+		return
+	}
+
+	// Detect mime type
+	mimeType := detectMimeType(fileName)
+
+	// Send file
+	file := FileAttachment{
+		FileName: fileName,
+		MimeType: mimeType,
+		Data:     data,
+	}
+
+	if err := fileSender.SendFile(e.ctx, msg.ReplyCtx, file); err != nil {
+		e.reply(p, msg.ReplyCtx, fmt.Sprintf("Error sending file: %v", err))
+		return
+	}
+}
+
+// detectMimeType guesses mime type from file extension
+func detectMimeType(fileName string) string {
+	ext := strings.ToLower(filepath.Ext(fileName))
+	switch ext {
+	case ".go":
+		return "text/x-go"
+	case ".md":
+		return "text/markdown"
+	case ".json":
+		return "application/json"
+	case ".txt":
+		return "text/plain"
+	case ".html", ".htm":
+		return "text/html"
+	case ".css":
+		return "text/css"
+	case ".js":
+		return "application/javascript"
+	case ".ts":
+		return "application/typescript"
+	case ".py":
+		return "text/x-python"
+	case ".sh":
+		return "application/x-sh"
+	case ".yaml", ".yml":
+		return "text/yaml"
+	case ".toml":
+		return "application/toml"
+	case ".xml":
+		return "application/xml"
+	case ".sql":
+		return "application/sql"
+	case ".log":
+		return "text/plain"
+	case ".pdf":
+		return "application/pdf"
+	case ".zip":
+		return "application/zip"
+	case ".tar":
+		return "application/x-tar"
+	case ".gz":
+		return "application/gzip"
+	default:
+		return "application/octet-stream"
+	}
 }
 
 // cmdSearch searches sessions by name or message content.

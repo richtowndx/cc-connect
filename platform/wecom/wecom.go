@@ -487,6 +487,98 @@ func (p *Platform) uploadImageMedia(accessToken string, img core.ImageAttachment
 	return result.MediaID, nil
 }
 
+// SendFile uploads and sends a file to the user.
+// Implements core.FileSender.
+func (p *Platform) SendFile(ctx context.Context, rctx any, file core.FileAttachment) error {
+	rc, ok := rctx.(replyContext)
+	if !ok {
+		return fmt.Errorf("wecom: SendFile: invalid reply context type %T", rctx)
+	}
+
+	accessToken, err := p.getAccessToken()
+	if err != nil {
+		return fmt.Errorf("wecom: send file: %w", err)
+	}
+
+	mediaID, err := p.uploadFileMedia(accessToken, file)
+	if err != nil {
+		return fmt.Errorf("wecom: send file: %w", err)
+	}
+
+	payload := map[string]any{
+		"touser":  rc.userID,
+		"msgtype": "file",
+		"agentid": p.agentID,
+		"file":    map[string]string{"media_id": mediaID},
+	}
+
+	body, _ := json.Marshal(payload)
+	apiURL := "https://qyapi.weixin.qq.com/cgi-bin/message/send?access_token=" + accessToken
+
+	resp, err := p.apiClient.Post(apiURL, "application/json", strings.NewReader(string(body)))
+	if err != nil {
+		return fmt.Errorf("wecom: send file: %w", err)
+	}
+	defer resp.Body.Close()
+
+	var result struct {
+		ErrCode int    `json:"errcode"`
+		ErrMsg  string `json:"errmsg"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return fmt.Errorf("wecom: decode send file response: %w", err)
+	}
+	if result.ErrCode != 0 {
+		return fmt.Errorf("wecom: send file failed: %d %s", result.ErrCode, result.ErrMsg)
+	}
+	return nil
+}
+
+// uploadFileMedia uploads a file to WeChat Work media API and returns the media_id.
+func (p *Platform) uploadFileMedia(accessToken string, file core.FileAttachment) (string, error) {
+	name := file.FileName
+	if name == "" {
+		name = "file"
+	}
+
+	body := &bytes.Buffer{}
+	writer := multipart.NewWriter(body)
+
+	part, err := writer.CreateFormFile("media", name)
+	if err != nil {
+		return "", fmt.Errorf("wecom: create form file: %w", err)
+	}
+	if _, err := part.Write(file.Data); err != nil {
+		return "", fmt.Errorf("wecom: write file data: %w", err)
+	}
+	if err := writer.Close(); err != nil {
+		return "", fmt.Errorf("wecom: close multipart writer: %w", err)
+	}
+
+	apiURL := "https://qyapi.weixin.qq.com/cgi-bin/media/upload?access_token=" + accessToken + "&type=file"
+	resp, err := p.apiClient.Post(apiURL, writer.FormDataContentType(), body)
+	if err != nil {
+		return "", fmt.Errorf("wecom: upload file: %w", err)
+	}
+	defer resp.Body.Close()
+
+	var result struct {
+		ErrCode  int    `json:"errcode"`
+		ErrMsg   string `json:"errmsg"`
+		MediaID  string `json:"media_id"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return "", fmt.Errorf("wecom: decode upload file response: %w", err)
+	}
+	if result.ErrCode != 0 {
+		return "", fmt.Errorf("wecom: upload file failed: %d %s", result.ErrCode, result.ErrMsg)
+	}
+	if result.MediaID == "" {
+		return "", fmt.Errorf("wecom: upload file: empty media_id")
+	}
+	return result.MediaID, nil
+}
+
 var _ core.ImageSender = (*Platform)(nil)
 
 func (p *Platform) sendMarkdown(accessToken, toUser, content string) error {

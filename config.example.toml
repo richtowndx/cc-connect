@@ -1054,6 +1054,28 @@ app_secret = "your-feishu-app-secret"
 # share_session_in_channel = false  # If true, all users in a group share one agent session / 群聊共享会话
 # markdown_support = false  # Enable Markdown messages (msg_type: 2). Requires bot permission. / 启用 Markdown 消息（msg_type: 2）。需要机器人具备该权限。
 
+# Mattermost (uncomment to enable / 取消注释以启用)
+# 1. Create a bot account in Mattermost System Console > Integrations > Bot Accounts
+#    在 Mattermost 系统控制台 > 集成 > 机器人账号 中创建机器人
+# 2. Copy the bot token / 复制机器人令牌
+# 3. Invite bot to channels or enable DM / 邀请机器人到频道或启用私信
+# Connection: WebSocket (no public URL needed) / WebSocket 连接（无需公网 IP）
+# Note: Bot responds to @mentions in channels, or all messages if group_reply_all is true
+# 注意：机器人在频道中响应 @提及，或设置 group_reply_all 为 true 时响应所有消息
+
+# [[projects.platforms]]
+# type = "mattermost"
+#
+# [projects.platforms.options]
+# base_url = "http://your-mattermost-server:8065"  # Mattermost server URL / Mattermost 服务器地址
+# token = "your-bot-token"                        # Bot token / 机器人令牌
+# allow_from = "*"                                # Allowed user IDs, e.g. "user1,user2"; "*" = all
+#                                                 # 允许的用户 ID，如 "user1,user2"；"*" 表示所有
+# group_reply_all = false                         # If true, respond to ALL channel messages without @mention
+#                                                 # 设为 true 时，频道中无需 @ 机器人 也会响应所有消息
+# share_session_in_channel = false                # If true, all users in a channel share one agent session
+#                                                 # 设为 true 时，频道内所有用户共享同一个 Agent 会话
+
 # =============================================================================
 # Project 5: Using Qoder CLI / 项目 5：使用 Qoder CLI (uncomment to enable / 取消注释以启用)
 # =============================================================================

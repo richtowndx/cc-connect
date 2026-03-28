@@ -6,14 +6,19 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math/rand"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/chenhg5/cc-connect/core"
 
 	"github.com/bwmarrin/discordgo"
+	"github.com/gorilla/websocket"
+	"golang.org/x/net/proxy"
 )
 
 func init() {
@@ -46,6 +51,7 @@ type Platform struct {
 	shareSessionInChannel      bool
 	threadIsolation            bool
 	respondToAtEveryoneAndHere bool
+	proxy                      string
 	session                    *discordgo.Session
 	handler                    core.MessageHandler
 	botID                      string
@@ -54,6 +60,8 @@ type Platform struct {
 	botRoleIDs                 sync.Map // guildID -> bot managed role ID
 	readyCh                    chan struct{}
 	seenMsgs                   sync.Map // message ID dedup: prevents duplicate MessageCreate events
+	stopCh                     chan struct{}
+	reconnecting               atomic.Bool
 }
 
 func New(opts map[string]any) (core.Platform, error) {
@@ -68,6 +76,7 @@ func New(opts map[string]any) (core.Platform, error) {
 	shareSessionInChannel, _ := opts["share_session_in_channel"].(bool)
 	threadIsolation, _ := opts["thread_isolation"].(bool)
 	respondToAtEveryoneAndHere, _ := opts["respond_to_at_everyone_and_here"].(bool)
+	proxyURL, _ := opts["proxy"].(string)
 	return &Platform{
 		token:                      token,
 		allowFrom:                  allowFrom,
@@ -77,6 +86,8 @@ func New(opts map[string]any) (core.Platform, error) {
 		readyCh:                    make(chan struct{}),
 		threadIsolation:            threadIsolation,
 		respondToAtEveryoneAndHere: respondToAtEveryoneAndHere,
+		proxy:                      proxyURL,
+		stopCh:                     make(chan struct{}),
 	}, nil
 }
 
@@ -377,6 +388,53 @@ func (p *Platform) Start(handler core.MessageHandler) error {
 	}
 	p.session = session
 
+	// Configure proxy if specified
+	if p.proxy != "" {
+		proxyURL, err := url.Parse(p.proxy)
+		if err != nil {
+			return fmt.Errorf("discord: invalid proxy URL %q: %w", p.proxy, err)
+		}
+
+		// Check if it's a SOCKS5 proxy
+		if proxyURL.Scheme == "socks5" {
+			// SOCKS5 proxy
+			var auth *proxy.Auth
+			if proxyURL.User != nil {
+				password, _ := proxyURL.User.Password()
+				auth = &proxy.Auth{
+					User:     proxyURL.User.Username(),
+					Password: password,
+				}
+			}
+			dialer, err := proxy.SOCKS5("tcp", proxyURL.Host, auth, nil)
+			if err != nil {
+				return fmt.Errorf("discord: create SOCKS5 dialer: %w", err)
+			}
+			session.Client = &http.Client{
+				Transport: &http.Transport{
+					Dial: dialer.Dial,
+				},
+			}
+			// Also configure WebSocket dialer for Gateway connection
+			session.Dialer = &websocket.Dialer{
+				NetDial: dialer.Dial,
+			}
+			slog.Info("discord: using SOCKS5 proxy", "proxy", proxyURL.Host)
+		} else {
+			// HTTP/HTTPS proxy
+			session.Client = &http.Client{
+				Transport: &http.Transport{
+					Proxy: http.ProxyURL(proxyURL),
+				},
+			}
+			// Also configure WebSocket dialer for Gateway connection
+			session.Dialer = &websocket.Dialer{
+				Proxy: http.ProxyURL(proxyURL),
+			}
+			slog.Info("discord: using HTTP proxy", "proxy", proxyURL.Host)
+		}
+	}
+
 	session.Identify.Intents = discordgo.IntentsGuilds | discordgo.IntentsGuildMessages | discordgo.IntentsDirectMessages | discordgo.IntentMessageContent
 
 	session.AddHandler(func(s *discordgo.Session, r *discordgo.Ready) {
@@ -505,11 +563,212 @@ func (p *Platform) Start(handler core.MessageHandler) error {
 		p.handleInteraction(s, i)
 	})
 
-	if err := session.Open(); err != nil {
+	// Open connection with reconnection loop
+	if err := p.openWithReconnect(session); err != nil {
 		return fmt.Errorf("discord: open gateway: %w", err)
 	}
 
 	return nil
+}
+
+// openWithReconnect attempts to open the connection and runs the reconnect loop
+func (p *Platform) openWithReconnect(session *discordgo.Session) error {
+	for {
+		select {
+		case <-p.stopCh:
+			return nil
+		default:
+		}
+
+		if err := session.Open(); err != nil {
+			if p.reconnecting.Load() {
+				// Already reconnecting, wait and retry
+				delay := time.Duration(30+rand.Intn(10)) * time.Second
+				slog.Info("discord: reconnect scheduled", "delay", delay)
+				select {
+				case <-p.stopCh:
+					return nil
+				case <-time.After(delay):
+					continue
+				}
+			}
+			return fmt.Errorf("discord: open gateway: %w", err)
+		}
+
+		// Connection successful, wait for disconnect
+		p.reconnecting.Store(false)
+		slog.Info("discord: connected successfully")
+
+		// Wait for either stop signal or disconnect event
+		select {
+		case <-p.stopCh:
+			return nil
+		case <-p.readyCh:
+			// readyCh is closed when bot is ready
+		}
+	}
+}
+
+// reconnectLoop handles reconnection with exponential backoff
+func (p *Platform) reconnectLoop() {
+	if !p.reconnecting.CompareAndSwap(false, true) {
+		return // Already reconnecting
+	}
+	defer p.reconnecting.Store(false)
+
+	for {
+		select {
+		case <-p.stopCh:
+			return
+		default:
+		}
+
+		delay := time.Duration(30+rand.Intn(10)) * time.Second
+		slog.Info("discord: reconnecting in", "delay", delay)
+		select {
+		case <-p.stopCh:
+			return
+		case <-time.After(delay):
+		}
+
+		session, err := discordgo.New("Bot " + p.token)
+		if err != nil {
+			slog.Warn("discord: failed to create session for reconnect", "error", err)
+			continue
+		}
+
+		// Configure proxy
+		if p.proxy != "" {
+			proxyURL, err := url.Parse(p.proxy)
+			if err == nil {
+				session.Client = &http.Client{
+					Transport: &http.Transport{
+						Proxy: http.ProxyURL(proxyURL),
+					},
+				}
+				session.Dialer = &websocket.Dialer{
+					Proxy: http.ProxyURL(proxyURL),
+				}
+			}
+		}
+
+		session.Identify.Intents = discordgo.IntentsGuilds | discordgo.IntentsGuildMessages | discordgo.IntentsDirectMessages | discordgo.IntentMessageContent
+
+		// Re-add handlers
+		session.AddHandler(func(s *discordgo.Session, r *discordgo.Ready) {
+			p.botID = r.User.ID
+			p.appID = r.User.ID
+			slog.Info("discord: reconnected", "bot", r.User.Username+"#"+r.User.Discriminator)
+			select {
+			case <-p.readyCh:
+			default:
+				close(p.readyCh)
+			}
+			for _, g := range r.Guilds {
+				if g == nil || g.ID == "" || g.Unavailable {
+					continue
+				}
+				p.cacheBotRoleIDForGuild(s, g.ID, g.Roles)
+			}
+		})
+
+		session.AddHandler(func(s *discordgo.Session, g *discordgo.GuildCreate) {
+			if g == nil || g.Guild == nil || g.ID == "" || g.Unavailable {
+				return
+			}
+			p.cacheBotRoleIDForGuild(s, g.ID, g.Roles)
+		})
+
+		session.AddHandler(func(s *discordgo.Session, m *discordgo.MessageCreate) {
+			if _, loaded := p.seenMsgs.LoadOrStore(m.ID, struct{}{}); loaded {
+				return
+			}
+			time.AfterFunc(2*time.Minute, func() { p.seenMsgs.Delete(m.ID) })
+
+			if m.Author.Bot || m.Author.ID == p.botID {
+				return
+			}
+			if core.IsOldMessage(m.Timestamp) {
+				return
+			}
+			if !core.AllowList(p.allowFrom, m.Author.ID) {
+				return
+			}
+
+			botRoleID := p.botRoleIDForGuild(m.GuildID)
+			if botRoleID == "" && m.GuildID != "" {
+				p.cacheBotRoleIDForGuild(s, m.GuildID, nil)
+				botRoleID = p.botRoleIDForGuild(m.GuildID)
+			}
+			if m.GuildID != "" && !p.groupReplyAll {
+				if !isDiscordBotMention(m, p.botID, botRoleID, p.respondToAtEveryoneAndHere) {
+					return
+				}
+				m.Content = stripDiscordMentionWithRole(m.Content, p.botID, botRoleID)
+				if m.MentionEveryone {
+					m.Content = stripEveryoneHere(m.Content)
+				}
+			}
+
+			sessionKey := p.makeSessionKey(m.ChannelID, m.Author.ID)
+			rctx := replyContext{channelID: m.ChannelID, messageID: m.ID}
+
+			var images []core.ImageAttachment
+			var audio *core.AudioAttachment
+			for _, att := range m.Attachments {
+				ct := strings.ToLower(att.ContentType)
+				if strings.HasPrefix(ct, "audio/") {
+					data, err := downloadURL(att.URL)
+					if err != nil {
+						continue
+					}
+					format := "ogg"
+					if parts := strings.SplitN(ct, "/", 2); len(parts) == 2 {
+						format = parts[1]
+					}
+					audio = &core.AudioAttachment{
+						MimeType: ct, Data: data, Format: format,
+					}
+				} else if att.Width > 0 && att.Height > 0 {
+					data, err := downloadURL(att.URL)
+					if err != nil {
+						continue
+					}
+					images = append(images, core.ImageAttachment{
+						MimeType: att.ContentType, Data: data, FileName: att.Filename,
+					})
+				}
+			}
+
+			if m.Content == "" && len(images) == 0 && audio == nil {
+				return
+			}
+
+			msg := &core.Message{
+				SessionKey: sessionKey, Platform: "discord",
+				MessageID: m.ID,
+				UserID:    m.Author.ID, UserName: m.Author.Username,
+				ChatName: p.resolveChannelName(m.ChannelID),
+				Content:  m.Content, Images: images, Audio: audio, ReplyCtx: rctx,
+			}
+			p.handler(p, msg)
+		})
+
+		session.AddHandler(func(s *discordgo.Session, i *discordgo.InteractionCreate) {
+			p.handleInteraction(s, i)
+		})
+
+		p.session = session
+
+		if err := session.Open(); err != nil {
+			slog.Warn("discord: reconnect failed", "error", err)
+			session.Close()
+			continue
+		}
+
+		slog.Info("discord: reconnected successfully")
+		return
+	}
 }
 
 // handleInteraction processes incoming Discord command and button interactions.
@@ -628,6 +887,7 @@ func (p *Platform) handleComponentInteraction(s *discordgo.Session, i *discordgo
 }
 
 func (p *Platform) Reply(ctx context.Context, rctx any, content string) error {
+	slog.Debug("discord: Reply called", "rctx_type", fmt.Sprintf("%T", rctx), "content_len", len(content))
 	switch rc := rctx.(type) {
 	case *interactionReplyCtx:
 		return p.sendInteraction(rc, content)
@@ -654,14 +914,18 @@ func (p *Platform) Send(ctx context.Context, rctx any, content string) error {
 // mechanism. The first call edits the deferred "thinking" response; subsequent
 // calls create followup messages.
 func (p *Platform) sendInteraction(ictx *interactionReplyCtx, content string) error {
+	slog.Debug("discord: sendInteraction called", "content_len", len(content), "channel_id", ictx.channelID)
+
 	chunks := core.SplitMessageCodeFenceAware(content, maxDiscordLen)
-	for _, chunk := range chunks {
+	for i, chunk := range chunks {
 		ictx.mu.Lock()
 		first := !ictx.firstDone
 		if first {
 			ictx.firstDone = true
 		}
 		ictx.mu.Unlock()
+
+		slog.Debug("discord: sending interaction chunk", "chunk", i+1, "total", len(chunks), "first", first)
 
 		var err error
 		if first {
@@ -677,6 +941,8 @@ func (p *Platform) sendInteraction(ictx *interactionReplyCtx, content string) er
 			if err != nil {
 				return fmt.Errorf("discord: send fallback: %w", err)
 			}
+		} else {
+			slog.Debug("discord: interaction chunk sent successfully", "chunk", i+1)
 		}
 	}
 	return nil
@@ -1023,6 +1289,7 @@ func (p *Platform) resolveChannelName(channelID string) string {
 }
 
 func (p *Platform) Stop() error {
+	close(p.stopCh)
 	if p.session != nil {
 		return p.session.Close()
 	}

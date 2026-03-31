@@ -13,26 +13,26 @@ import (
 )
 
 const (
-	reconnectInitialDelay = time.Second
-	reconnectMaxDelay    = 30 * time.Second
+	reconnectInitialDelay  = time.Second
+	reconnectMaxDelay      = 30 * time.Second
 	stableConnectionWindow = 10 * time.Second
 
 	// Keepalive settings
-	pingInterval     = 30 * time.Second
-	pongTimeout      = 40 * time.Second
-	maxMissedPongs   = 3
+	pingInterval   = 30 * time.Second
+	pongTimeout    = 40 * time.Second
+	maxMissedPongs = 3
 )
 
 // WSConnection handles WebSocket connection to Mattermost
 type WSConnection struct {
-	client   *Client
-	wsURL    string
-	token    string
+	client *Client
+	wsURL  string
+	token  string
 
-	mu           sync.RWMutex
-	conn         *websocket.Conn
-	seq          int64
-	stopping     bool
+	mu            sync.RWMutex
+	conn          *websocket.Conn
+	seq           int64
+	stopping      bool
 	everConnected bool
 
 	onPosted func(post *Post, payload *EventPayload)
@@ -40,11 +40,11 @@ type WSConnection struct {
 	dialer websocket.Dialer
 
 	// keepalive state
-	lastPong      time.Time
-	missedPongs   int
-	pingStopCh    chan struct{}
-	pingDoneCh    chan struct{}
-	dead          bool // connection is considered dead
+	lastPong    time.Time
+	missedPongs int
+	pingStopCh  chan struct{}
+	pingDoneCh  chan struct{}
+	dead        bool // connection is considered dead
 }
 
 // NewWSConnection creates a new WebSocket connection handler
@@ -98,7 +98,6 @@ func (ws *WSConnection) Connect(ctx context.Context) error {
 	// Set up ping/pong handlers
 	conn.SetPingHandler(func(appData string) error {
 		// Automatically respond to server pings with pongs
-		slog.Debug("mattermost: server ping received")
 		if err := conn.WriteControl(websocket.PongMessage, []byte(appData), time.Now().Add(5*time.Second)); err != nil {
 			slog.Warn("mattermost: pong write failed", "error", err)
 		}
@@ -109,7 +108,6 @@ func (ws *WSConnection) Connect(ctx context.Context) error {
 		ws.lastPong = time.Now()
 		ws.missedPongs = 0
 		ws.mu.Unlock()
-		slog.Debug("mattermost: pong received")
 		return nil
 	})
 
@@ -208,7 +206,6 @@ func (ws *WSConnection) keepalive() {
 			}
 			return
 		}
-		slog.Debug("mattermost: ping sent")
 
 		// Wait for next tick
 		select {

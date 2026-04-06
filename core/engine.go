@@ -594,6 +594,7 @@ var privilegedCommands = map[string]bool{
 	"dir":     true,
 	"restart": true,
 	"upgrade": true,
+	"rm":      true,
 }
 
 // isAdmin checks whether the given user ID is authorized for privileged commands.
@@ -2711,7 +2712,7 @@ var builtinCommands = []struct {
 	{[]string{"upgrade", "update"}, "upgrade"},
 	{[]string{"restart"}, "restart"},
 	{[]string{"alias"}, "alias"},
-	{[]string{"delete", "del", "rm"}, "delete"},
+	{[]string{"delete", "del"}, "delete"},
 	{[]string{"bind"}, "bind"},
 	{[]string{"search", "find"}, "search"},
 	{[]string{"shell", "sh", "exec", "run"}, "shell"},
@@ -2721,6 +2722,7 @@ var builtinCommands = []struct {
 	{[]string{"tts"}, "tts"},
 	{[]string{"workspace", "ws"}, "workspace"},
 	{[]string{"whoami", "myid"}, "whoami"},
+	{[]string{"rm", "remove", "deletefile"}, "rm"},
 }
 
 // isBtwCommand checks if a trimmed message starts with a /btw command.
@@ -2919,6 +2921,8 @@ func (e *Engine) handleCommand(p Platform, msg *Message, raw string) bool {
 		return true
 	case "whoami":
 		e.cmdWhoami(p, msg)
+	case "rm":
+		e.cmdRm(p, msg, args)
 	default:
 		if custom, ok := e.commands.Resolve(cmd); ok {
 			if disabledCmds[strings.ToLower(custom.Name)] {
@@ -3661,6 +3665,99 @@ func (e *Engine) cmdLs(p Platform, msg *Message, args []string) {
 
 	sb.WriteString(fmt.Sprintf("\n%d files, %d directories", fileCount, dirCount))
 	e.reply(p, msg.ReplyCtx, sb.String())
+}
+
+// cmdRm deletes a file or directory from the current working directory.
+// Usage: /rm <path>
+func (e *Engine) cmdRm(p Platform, msg *Message, args []string) {
+	if len(args) == 0 {
+		e.reply(p, msg.ReplyCtx, "Usage: /rm <path>\nExample: /rm temp.log\nExample: /rm /absolute/path/to/file")
+		return
+	}
+
+	// Get current working directory
+	agent, _, _, err := e.commandContext(p, msg)
+	if err != nil {
+		e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgWsResolutionError, err))
+		return
+	}
+	switcher, ok := agent.(WorkDirSwitcher)
+	if !ok {
+		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgDirNotSupported))
+		return
+	}
+
+	currentDir := switcher.GetWorkDir()
+	targetPath := strings.Join(args, " ")
+
+	// Resolve path: handle both relative and absolute paths
+	var filePath string
+	if filepath.IsAbs(targetPath) {
+		filePath = filepath.Clean(targetPath)
+	} else {
+		filePath = filepath.Join(currentDir, targetPath)
+	}
+
+	// Safety check: ensure the resolved path is within the workspace
+	absFilePath, err := filepath.Abs(filePath)
+	if err != nil {
+		e.reply(p, msg.ReplyCtx, fmt.Sprintf("Error resolving path: %v", err))
+		return
+	}
+	absCurrentDir, err := filepath.Abs(currentDir)
+	if err != nil {
+		absCurrentDir = currentDir
+	}
+
+	// Prevent path traversal attacks
+	if !strings.HasPrefix(absFilePath, absCurrentDir) {
+		slog.Warn("rm command blocked: path outside workspace",
+			"user_id", msg.UserID, "platform", msg.Platform,
+			"project", e.name, "path", absFilePath, "workspace", absCurrentDir)
+		e.reply(p, msg.ReplyCtx, "Error: Cannot delete files outside the workspace directory")
+		return
+	}
+
+	// Check if file/directory exists
+	info, err := os.Stat(absFilePath)
+	if err != nil {
+		e.reply(p, msg.ReplyCtx, fmt.Sprintf("Error: %v", err))
+		return
+	}
+
+	// Log the deletion
+	slog.Info("rm command executing",
+		"user_id", msg.UserID, "platform", msg.Platform,
+		"project", e.name, "path", absFilePath, "is_dir", info.IsDir())
+
+	// Execute rm -rf
+	go func() {
+		ctx, cancel := context.WithTimeout(e.ctx, 30*time.Second)
+		defer cancel()
+
+		cmd := exec.CommandContext(ctx, "rm", "-rf", absFilePath)
+		output, err := cmd.CombinedOutput()
+
+		if ctx.Err() == context.DeadlineExceeded {
+			e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgCommandTimeout), "rm -rf "+absFilePath))
+			return
+		}
+
+		if err != nil {
+			errMsg := strings.TrimSpace(string(output))
+			if errMsg == "" {
+				errMsg = err.Error()
+			}
+			e.reply(p, msg.ReplyCtx, fmt.Sprintf("Error deleting: %s", errMsg))
+			return
+		}
+
+		fileType := "file"
+		if info.IsDir() {
+			fileType = "directory"
+		}
+		e.reply(p, msg.ReplyCtx, fmt.Sprintf("✅ Deleted %s: %s", fileType, targetPath))
+	}()
 }
 
 // cmdFget sends a file from the current working directory to the user.
@@ -9218,6 +9315,7 @@ func (e *Engine) setupMemoryFile() (setupResult, string, error) {
 	existing, _ := os.ReadFile(filePath)
 	existingText := string(existing)
 	block := "\n" + ccConnectInstructionMarker + "\n" + AgentSystemPrompt() + "\n"
+
 	if idx := strings.Index(existingText, ccConnectInstructionMarker); idx >= 0 {
 		if strings.Contains(existingText[idx:], AgentSystemPrompt()) {
 			return setupExists, baseName, nil

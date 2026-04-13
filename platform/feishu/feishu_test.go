@@ -194,6 +194,61 @@ func TestHasComplexMarkdown(t *testing.T) {
 	}
 }
 
+func TestCountMarkdownTables(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  int
+	}{
+		{"no tables", "hello world", 0},
+		{"one table", "| A | B |\n|---|---|\n| 1 | 2 |", 1},
+		{"two tables separated by text", "| A |\n|---|\n\nsome text\n\n| B |\n|---|", 2},
+		{"consecutive tables no gap", "| A |\n|---|\n| 1 |\n| B |\n|---|", 1},
+		{"six tables", "| A |\n|---|\n\nx\n\n| B |\n|---|\n\nx\n\n| C |\n|---|\n\nx\n\n| D |\n|---|\n\nx\n\n| E |\n|---|\n\nx\n\n| F |\n|---|", 6},
+		{"table inside code block is still counted", "```\n| A |\n```\n\n| B |\n|---|", 2},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := countMarkdownTables(tt.input)
+			if got != tt.want {
+				t.Errorf("countMarkdownTables() = %d, want %d", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestBuildReplyContent_FallbackWhenManyTables(t *testing.T) {
+	// Build content with 6 tables (exceeds the 5-table card limit).
+	var sb strings.Builder
+	for i := 0; i < 6; i++ {
+		if i > 0 {
+			sb.WriteString("\n\nsome text\n\n")
+		}
+		sb.WriteString("| H |\n|---|\n| V |")
+	}
+	content := sb.String()
+
+	msgType, _ := buildReplyContent(content)
+	if msgType == larkim.MsgTypeInteractive {
+		t.Errorf("expected non-card message type for >5 tables, got interactive")
+	}
+
+	// With exactly 5 tables, card should still be used.
+	sb.Reset()
+	for i := 0; i < 5; i++ {
+		if i > 0 {
+			sb.WriteString("\n\nsome text\n\n")
+		}
+		sb.WriteString("| H |\n|---|\n| V |")
+	}
+	content5 := sb.String()
+
+	msgType5, _ := buildReplyContent(content5)
+	if msgType5 != larkim.MsgTypeInteractive {
+		t.Errorf("expected interactive card for 5 tables, got %s", msgType5)
+	}
+}
+
 func TestParseInlineMarkdown_BoldAndCode(t *testing.T) {
 	elements := parseInlineMarkdown("**bold** and `code`")
 	hasBold, hasCode := false, false
@@ -211,6 +266,55 @@ func TestParseInlineMarkdown_BoldAndCode(t *testing.T) {
 	}
 	if !hasBold || !hasCode {
 		t.Errorf("expected bold and code, got %v", elements)
+	}
+}
+
+func TestExtractPostPlainText_FlatFormat(t *testing.T) {
+	content := `{"title":"公告","content":[[{"tag":"text","text":"第一段"}],[{"tag":"text","text":"第二段"}]]}`
+	got := extractPostPlainText(content)
+	if got != "公告\n第一段\n第二段" {
+		t.Errorf("expected '公告\\n第一段\\n第二段', got %q", got)
+	}
+}
+
+func TestExtractPostPlainText_LocaleWrapped(t *testing.T) {
+	content := `{"zh_cn":{"title":"标题","content":[[{"tag":"text","text":"内容"}]]}}`
+	got := extractPostPlainText(content)
+	if got != "标题\n内容" {
+		t.Errorf("expected '标题\\n内容', got %q", got)
+	}
+}
+
+func TestExtractPostPlainText_NoTitle(t *testing.T) {
+	content := `{"content":[[{"tag":"text","text":"仅内容"}]]}`
+	got := extractPostPlainText(content)
+	if got != "仅内容" {
+		t.Errorf("expected '仅内容', got %q", got)
+	}
+}
+
+func TestExtractPostPlainText_Empty(t *testing.T) {
+	got := extractPostPlainText(`{}`)
+	if got != "" {
+		t.Errorf("expected empty string, got %q", got)
+	}
+}
+
+func TestExtractPostPlainText_NonTextTagsIgnored(t *testing.T) {
+	content := `{"content":[[{"tag":"text","text":"hello"},{"tag":"a","text":"link","href":"http://x.com"}]]}`
+	got := extractPostPlainText(content)
+	if got != "hello" {
+		t.Errorf("expected 'hello', got %q", got)
+	}
+}
+
+func TestExtractPostPlainText_CodeBlock(t *testing.T) {
+	content := `{"content":[[{"tag":"text","text":"see:"},{"tag":"code_block","language":"go","text":"fmt.Println()"}]]}`
+	got := extractPostPlainText(content)
+	// Same paragraph: inline elements are concatenated (no extra newline before the fence).
+	want := "see:```go\nfmt.Println()\n```"
+	if got != want {
+		t.Errorf("expected %q, got %q", want, got)
 	}
 }
 

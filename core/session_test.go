@@ -1,6 +1,7 @@
 package core
 
 import (
+	"os"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -242,6 +243,91 @@ func TestSession_GetAgentSessionID(t *testing.T) {
 	}
 }
 
+func TestSession_SetAgentSessionID_RejectsContinueSentinel(t *testing.T) {
+	s := &Session{}
+	s.SetAgentSessionID("real", "ag")
+	s.SetAgentSessionID(ContinueSession, "ag")
+	if got := s.GetAgentSessionID(); got != "real" {
+		t.Fatalf("ContinueSession must not clobber stored id, got %q", got)
+	}
+	s.SetAgentSessionID("", "")
+	if got := s.GetAgentSessionID(); got != "" {
+		t.Fatalf("expected clear, got %q", got)
+	}
+}
+
+func TestSession_CompareAndSet_ReplacesContinueSentinel(t *testing.T) {
+	s := &Session{}
+	s.mu.Lock()
+	s.AgentSessionID = ContinueSession
+	s.mu.Unlock()
+	if !s.CompareAndSetAgentSessionID("uuid-1", "pi") {
+		t.Fatal("expected CompareAndSet to replace erroneous ContinueSession slot")
+	}
+	if s.GetAgentSessionID() != "uuid-1" {
+		t.Fatalf("GetAgentSessionID = %q, want uuid-1", s.GetAgentSessionID())
+	}
+	if s.CompareAndSetAgentSessionID("uuid-2", "pi") {
+		t.Fatal("expected second CompareAndSet to fail when real id already set")
+	}
+}
+
+func TestSession_SetAgentInfo_NormalizesContinueSentinel(t *testing.T) {
+	s := &Session{}
+	s.SetAgentInfo(ContinueSession, "pi", "n")
+	if s.GetAgentSessionID() != "" {
+		t.Fatalf("SetAgentInfo(ContinueSession) should store empty id, got %q", s.GetAgentSessionID())
+	}
+}
+
+func TestSessionManager_Load_SanitizesContinueSentinel(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "sessions.json")
+	raw := `{
+  "sessions": {
+    "s1": {
+      "id": "s1",
+      "name": "default",
+      "agent_session_id": "__continue__",
+      "agent_type": "pi",
+      "history": [],
+      "created_at": "2020-01-01T00:00:00Z",
+      "updated_at": "2020-01-01T00:00:00Z"
+    }
+  },
+  "active_session": {"user1": "s1"},
+  "user_sessions": {"user1": ["s1"]},
+  "counter": 1
+}`
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sm := NewSessionManager(path)
+	s := sm.GetOrCreateActive("user1")
+	if got := s.GetAgentSessionID(); got != "" {
+		t.Fatalf("loaded session should clear ContinueSession, got %q", got)
+	}
+}
+
+func TestSessionManager_Save_StripsContinueSentinel(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "sessions.json")
+	sm := NewSessionManager(path)
+	sm.NewSession("u1", "x")
+	s := sm.GetOrCreateActive("u1")
+	s.mu.Lock()
+	s.AgentSessionID = ContinueSession
+	s.AgentType = "pi"
+	s.mu.Unlock()
+	sm.Save()
+	sm2 := NewSessionManager(path)
+	// Same user key should reload the same logical session without sentinel.
+	s2 := sm2.GetOrCreateActive("u1")
+	if got := s2.GetAgentSessionID(); got != "" {
+		t.Fatalf("after save+reload want empty agent_session_id, got %q", got)
+	}
+}
+
 func TestSession_GetName(t *testing.T) {
 	s := &Session{Name: "test-session"}
 	if got := s.GetName(); got != "test-session" {
@@ -414,5 +500,56 @@ func TestSessionManager_StorePath(t *testing.T) {
 	sm2 := NewSessionManager("")
 	if got := sm2.StorePath(); got != "" {
 		t.Errorf("StorePath() empty = %q, want empty string", got)
+	}
+}
+
+func TestKnownAgentSessionIDs(t *testing.T) {
+	sm := NewSessionManager("")
+	s1 := sm.NewSession("user1", "a")
+	s1.SetAgentSessionID("uuid-aaa", "claude")
+	s2 := sm.NewSession("user1", "b")
+	s2.SetAgentSessionID("uuid-bbb", "claude")
+	sm.NewSession("user1", "c") // no agent session id
+
+	known := sm.KnownAgentSessionIDs()
+	if len(known) != 2 {
+		t.Fatalf("KnownAgentSessionIDs len = %d, want 2", len(known))
+	}
+	if _, ok := known["uuid-aaa"]; !ok {
+		t.Fatal("expected uuid-aaa in known set")
+	}
+	if _, ok := known["uuid-bbb"]; !ok {
+		t.Fatal("expected uuid-bbb in known set")
+	}
+}
+
+func TestFilterOwnedSessions_FiltersUnknown(t *testing.T) {
+	all := []AgentSessionInfo{
+		{ID: "owned-1"},
+		{ID: "external-1"},
+		{ID: "owned-2"},
+		{ID: "external-2"},
+	}
+	known := map[string]struct{}{
+		"owned-1": {},
+		"owned-2": {},
+	}
+	filtered := filterOwnedSessions(all, known)
+	if len(filtered) != 2 {
+		t.Fatalf("filterOwnedSessions len = %d, want 2", len(filtered))
+	}
+	if filtered[0].ID != "owned-1" || filtered[1].ID != "owned-2" {
+		t.Fatalf("filtered = %v, want owned-1 and owned-2", filtered)
+	}
+}
+
+func TestFilterOwnedSessions_EmptyKnownReturnsAll(t *testing.T) {
+	all := []AgentSessionInfo{
+		{ID: "session-1"},
+		{ID: "session-2"},
+	}
+	filtered := filterOwnedSessions(all, map[string]struct{}{})
+	if len(filtered) != 2 {
+		t.Fatalf("filterOwnedSessions with empty known = %d, want 2", len(filtered))
 	}
 }

@@ -65,6 +65,7 @@ type Platform struct {
 	botRoleIDs                 sync.Map // guildID -> bot managed role ID
 	readyCh                    chan struct{}
 	seenMsgs                   sync.Map // message ID dedup: prevents duplicate MessageCreate events
+	seenInteractions           sync.Map // interaction ID dedup
 	stopCh                     chan struct{}
 	reconnecting               atomic.Bool
 }
@@ -81,6 +82,7 @@ func New(opts map[string]any) (core.Platform, error) {
 	shareSessionInChannel, _ := opts["share_session_in_channel"].(bool)
 	threadIsolation, _ := opts["thread_isolation"].(bool)
 	respondToAtEveryoneAndHere, _ := opts["respond_to_at_everyone_and_here"].(bool)
+	progressStyle, _ := opts["progress_style"].(string)
 	proxyURL, _ := opts["proxy"].(string)
 	return &Platform{
 		token:                      token,
@@ -100,10 +102,10 @@ func New(opts map[string]any) (core.Platform, error) {
 func (p *Platform) Name() string { return "discord" }
 
 func (p *Platform) selfPlatform() core.Platform {
-	if p != nil && p.self != nil {
-		return p.self
+	if p == nil {
+		return p
 	}
-	return p
+	return &progressPlatform{p}
 }
 
 func (p *Platform) dispatchMessage(msg *core.Message) {
@@ -433,12 +435,6 @@ func (p *Platform) Start(handler core.MessageHandler) error {
 	session, err := discordgo.New("Bot " + p.token)
 	if err != nil {
 		return fmt.Errorf("discord: create session: %w", err)
-	}
-	if p.proxyURL != nil {
-		transport := &http.Transport{Proxy: http.ProxyURL(p.proxyURL)}
-		session.Client = &http.Client{Transport: transport, Timeout: 60 * time.Second}
-		session.Dialer = &websocket.Dialer{Proxy: http.ProxyURL(p.proxyURL)}
-		slog.Info("discord: using proxy", "proxy", p.proxyURL.Host)
 	}
 	p.session = session
 

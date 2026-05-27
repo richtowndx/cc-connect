@@ -211,8 +211,8 @@ type Engine struct {
 
 	// Terminal observation (--observe)
 	observeEnabled    bool
-	observeProjectDir string             // ~/.claude/projects/{projectKey}
-	observeSessionKey string             // e.g. "slack:C123:U456" — target for forwarding
+	observeProjectDir string // ~/.claude/projects/{projectKey}
+	observeSessionKey string // e.g. "slack:C123:U456" — target for forwarding
 	observeCancel     context.CancelFunc
 
 	// Interactive agent session management
@@ -1735,6 +1735,18 @@ func (e *Engine) handlePendingPermission(p Platform, msg *Message, content strin
 	if len(pending.Questions) > 0 {
 		curIdx := pending.CurrentQuestion
 		q := pending.Questions[curIdx]
+
+		// Allow users to enable "approve all" even when the agent asks via AskUserQuestion
+		// (common for pi extension UI confirmations). Only auto-applies to confirm-style prompts.
+		lower := strings.ToLower(strings.TrimSpace(content))
+		method, _ := pending.ToolInput["method"].(string)
+		if isApproveAllResponse(lower) && strings.EqualFold(strings.TrimSpace(method), "confirm") {
+			state.mu.Lock()
+			state.approveAll = true
+			state.mu.Unlock()
+			content = "Yes"
+		}
+
 		answer := e.resolveAskQuestionAnswer(q, content)
 
 		if pending.Answers == nil {
@@ -2604,6 +2616,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			autoApprove := state.approveAll
 			state.mu.Unlock()
 
+			// Approve-all mode: for normal tool permissions we can respond immediately.
 			if autoApprove && !isAskQuestion {
 				slog.Debug("auto-approving (approve-all)", "request_id", event.RequestID, "tool", event.ToolName)
 				_ = state.agentSession.RespondPermission(event.RequestID, PermissionResult{
@@ -2611,6 +2624,22 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 					UpdatedInput: event.ToolInputRaw,
 				})
 				continue
+			}
+
+			// Special case for pi: many extension UI confirmations (method=confirm) are surfaced as AskUserQuestion.
+			// When the user previously chose "allow all", auto-confirm these so long tasks don't stall.
+			if autoApprove && isAskQuestion {
+				method, _ := event.ToolInputRaw["method"].(string)
+				if strings.EqualFold(strings.TrimSpace(method), "confirm") {
+					slog.Debug("auto-confirming AskUserQuestion (approve-all)", "request_id", event.RequestID)
+					_ = state.agentSession.RespondPermission(event.RequestID, PermissionResult{
+						Behavior: "allow",
+						UpdatedInput: map[string]any{
+							"answers": map[string]any{"0": "Yes"},
+						},
+					})
+					continue
+				}
 			}
 
 			// Flush accumulated text segment before permission prompt
@@ -2631,10 +2660,21 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				sp.detachPreview() // keep frozen preview visible as permanent message
 			}
 
-			slog.Info("permission request",
+			logFields := []any{
 				"request_id", event.RequestID,
 				"tool", event.ToolName,
-			)
+			}
+			if isAskQuestion && len(event.Questions) > 0 {
+				method, _ := event.ToolInputRaw["method"].(string)
+				q := event.Questions[0]
+				logFields = append(logFields,
+					"method", strings.TrimSpace(method),
+					"question", truncateIf(q.Question, 120),
+					"header", truncateIf(q.Header, 200),
+					"options", len(q.Options),
+				)
+			}
+			slog.Info("permission request", logFields...)
 
 			pending := &pendingPermission{
 				RequestID:    event.RequestID,

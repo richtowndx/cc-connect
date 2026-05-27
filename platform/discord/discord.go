@@ -68,6 +68,8 @@ type Platform struct {
 	seenInteractions           sync.Map // interaction ID dedup
 	stopCh                     chan struct{}
 	reconnecting               atomic.Bool
+
+	self core.Platform // stable wrapper used for dispatchMessage
 }
 
 func New(opts map[string]any) (core.Platform, error) {
@@ -84,11 +86,19 @@ func New(opts map[string]any) (core.Platform, error) {
 	respondToAtEveryoneAndHere, _ := opts["respond_to_at_everyone_and_here"].(bool)
 	progressStyle, _ := opts["progress_style"].(string)
 	proxyURL, _ := opts["proxy"].(string)
-	return &Platform{
+
+	style := strings.ToLower(strings.TrimSpace(progressStyle))
+	if style == "" || style == "legacy" {
+		style = "legacy"
+	} else if style != "compact" && style != "card" {
+		return nil, fmt.Errorf("discord: invalid progress_style %q (valid: legacy, compact, card)", progressStyle)
+	}
+
+	base := &Platform{
 		token:                      token,
 		allowFrom:                  allowFrom,
 		guildID:                    guildID,
-		progressStyle:              progressStyle,
+		progressStyle:              style,
 		groupReplyAll:              groupReplyAll,
 		shareSessionInChannel:      shareSessionInChannel,
 		readyCh:                    make(chan struct{}),
@@ -96,23 +106,30 @@ func New(opts map[string]any) (core.Platform, error) {
 		respondToAtEveryoneAndHere: respondToAtEveryoneAndHere,
 		proxy:                      proxyURL,
 		stopCh:                     make(chan struct{}),
-	}, nil
+	}
+
+	// In legacy mode, return the base platform without the progress interfaces.
+	if style == "legacy" {
+		base.self = base
+		return base, nil
+	}
+
+	wrapped := &progressPlatform{Platform: base}
+	base.self = wrapped
+	return wrapped, nil
 }
 
 func (p *Platform) Name() string { return "discord" }
-
-func (p *Platform) selfPlatform() core.Platform {
-	if p == nil {
-		return p
-	}
-	return &progressPlatform{p}
-}
 
 func (p *Platform) dispatchMessage(msg *core.Message) {
 	if p == nil || p.handler == nil {
 		return
 	}
-	p.handler(p.selfPlatform(), msg)
+	self := p.self
+	if self == nil {
+		self = p
+	}
+	p.handler(self, msg)
 }
 
 func (p *progressPlatform) ProgressStyle() string {

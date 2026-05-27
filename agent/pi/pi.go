@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -12,6 +13,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/chenhg5/cc-connect/core"
 )
@@ -20,7 +22,7 @@ func init() {
 	core.RegisterAgent("pi", New)
 }
 
-// Agent drives the pi coding agent CLI (`pi --mode json --no-input`).
+// Agent drives the pi coding agent CLI in RPC mode (`pi --mode rpc`).
 type Agent struct {
 	cmd        string // path to pi binary
 	workDir    string
@@ -42,11 +44,15 @@ func New(opts map[string]any) (core.Agent, error) {
 
 	cmd, _ := opts["cmd"].(string)
 	if cmd == "" {
+		// Backwards-compatible alias
+		cmd, _ = opts["command"].(string)
+	}
+	if cmd == "" {
 		cmd = "pi"
 	}
 
 	if _, err := exec.LookPath(cmd); err != nil {
-		return nil, fmt.Errorf("pi: '%s' not found in PATH, install with: npm install -g @mariozechner/pi-coding-agent", cmd)
+		return nil, fmt.Errorf("pi: %q not found in PATH, install with: npm install -g @earendil-works/pi-coding-agent", cmd)
 	}
 
 	return &Agent{
@@ -83,8 +89,100 @@ func (a *Agent) GetModel() string {
 	return a.model
 }
 
-func (a *Agent) AvailableModels(_ context.Context) []core.ModelOption {
-	return nil // Pi uses its own model registry; no static list here.
+func (a *Agent) AvailableModels(ctx context.Context) []core.ModelOption {
+	// Pi has a first-class RPC command for listing configured models.
+	// We spawn a short-lived `pi --mode rpc --no-session` process and call
+	// get_available_models. This avoids interfering with the user's ongoing
+	// interactive sessions.
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	a.mu.Lock()
+	cmdPath := a.cmd
+	workDir := a.workDir
+	extraEnv := append([]string{}, a.sessionEnv...)
+	a.mu.Unlock()
+
+	callCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	procCtx, procCancel := context.WithCancel(callCtx)
+	defer procCancel()
+
+	cmd := exec.CommandContext(procCtx, cmdPath, "--mode", "rpc", "--no-session")
+	cmd.Dir = workDir
+	cmd.Env = core.MergeEnv(os.Environ(), extraEnv)
+
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		slog.Warn("pi: AvailableModels stdin pipe", "error", err)
+		return nil
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		slog.Warn("pi: AvailableModels stdout pipe", "error", err)
+		return nil
+	}
+	// Avoid blocking on stderr; we don't need it for this one-shot call.
+	cmd.Stderr = io.Discard
+
+	tr := newRPCTransport(stdout, stdin, nil)
+	if err := cmd.Start(); err != nil {
+		slog.Warn("pi: AvailableModels start", "error", err)
+		return nil
+	}
+
+	done := make(chan struct{})
+	go func() {
+		tr.readLoop(procCtx)
+		close(done)
+	}()
+
+	resp, err := tr.call(callCtx, map[string]any{"type": "get_available_models"})
+	// Stop the helper process no matter what.
+	procCancel()
+	_ = cmd.Wait()
+	<-done
+
+	if err != nil {
+		slog.Warn("pi: get_available_models failed", "error", err)
+		return nil
+	}
+	if err := resp.asError(); err != nil {
+		slog.Warn("pi: get_available_models error", "error", err)
+		return nil
+	}
+
+	var data struct {
+		Models []struct {
+			ID       string `json:"id"`
+			Name     string `json:"name"`
+			Provider string `json:"provider"`
+		} `json:"models"`
+	}
+	if len(resp.Data) == 0 {
+		return nil
+	}
+	if err := json.Unmarshal(resp.Data, &data); err != nil {
+		slog.Warn("pi: parse get_available_models", "error", err)
+		return nil
+	}
+
+	out := make([]core.ModelOption, 0, len(data.Models))
+	for _, m := range data.Models {
+		if strings.TrimSpace(m.ID) == "" {
+			continue
+		}
+		name := m.ID
+		if strings.TrimSpace(m.Provider) != "" {
+			name = m.Provider + "/" + m.ID
+		}
+		opt := core.ModelOption{Name: name, Desc: strings.TrimSpace(m.Name)}
+		// Convenient alias: allow `/model switch <id>`.
+		opt.Alias = m.ID
+		out = append(out, opt)
+	}
+	return out
 }
 
 func (a *Agent) SetSessionEnv(env []string) {

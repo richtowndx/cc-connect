@@ -2,6 +2,7 @@
 # Binary outputs
 # ============================================================================
 /cc-connect
+/cmd/cc-connect/cc-connect
 *.exe
 *.exe~
 *.dll
@@ -36,6 +37,8 @@ vendor/
 # ============================================================================
 # Runtime configuration (contains secrets)
 config.toml
+.config.toml.lock
+config\ copy.toml
 .env
 *.local.toml
 

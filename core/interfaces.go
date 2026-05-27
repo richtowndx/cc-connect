@@ -59,35 +59,31 @@ type PlatformPromptInjector interface {
 // cc-connect capabilities (cron scheduling, etc.).
 // The prompt is designed to be appended to the agent's existing system prompt.
 func AgentSystemPrompt() string {
-	return ""
-	// 	return `You are running inside cc-connect, a bridge that connects you to messaging platforms.
-	// Your normal text responses are automatically delivered to the user — just reply normally, do NOT use cc-connect send for ordinary text replies.
+	return `You are running inside cc-connect, a bridge that connects you to messaging platforms.
+Your normal text responses are automatically delivered to the user — just reply normally; do NOT use cc-connect send for ordinary text replies.
 
-	// ## Available tools
+## Send generated images or files back to the user
+When you generate a local image or file that should be sent to the user, use:
 
-	// ### Send generated images or files back to the user
-	// When you generate a local image or file that should be sent to the user, use:
+  cc-connect send --image /absolute/path/to/image.png
+  cc-connect send --file /absolute/path/to/report.pdf
+  cc-connect send --file /absolute/path/to/report.pdf --image /absolute/path/to/chart.png
 
-	//   cc-connect send --image /absolute/path/to/image.png
-	//   cc-connect send --file /absolute/path/to/report.pdf
-	//   cc-connect send --file /absolute/path/to/report.pdf --image /absolute/path/to/chart.png
+You may repeat --image / --file multiple times.
+If you include --message, do not repeat the exact same sentence again in your normal reply, because your normal reply is also delivered automatically.
 
-	// You may repeat --image / --file multiple times. Use this only for generated attachments that need to be delivered to the user.
-	// If you include --message, do not repeat the exact same sentence again in your normal reply, because your normal reply is also delivered automatically.
+## Scheduled tasks (cron)
+When the user asks you to do something on a schedule, use the Bash tool to run:
 
-	// ### Scheduled tasks (cron)
-	// When the user asks you to do something on a schedule (e.g. "每天早上6点帮我总结GitHub trending"), use the Bash tool to run:
+  cc-connect cron add --cron "<min> <hour> <day> <month> <weekday>" --prompt "<task description>" --desc "<short label>"
 
-	//   cc-connect cron add --cron "<min> <hour> <day> <month> <weekday>" --prompt "<task description>" --desc "<short label>"
+Environment variables CC_PROJECT and CC_SESSION_KEY are already set, so you do NOT need to specify --project or --session-key.
 
-	// Environment variables CC_PROJECT and CC_SESSION_KEY are already set, so you do NOT need to specify --project or --session-key.
-
-	// Optional flags:
-	//   --session-mode <mode>     reuse (default) or new-per-run (fresh session each trigger)
-	//   --timeout-mins <n>        max wait per run in minutes (default 30, 0 = unlimited)
-	//   --exec <command>          run a shell command directly instead of --prompt
-
-	// Examples:
+Optional flags:
+  --session-mode <mode>     reuse (default) or new-per-run (fresh session each trigger)
+  --timeout-mins <n>        max wait per run in minutes (default 30, 0 = unlimited)
+  --exec <command>          run a shell command directly instead of --prompt
+`
 	//   cc-connect cron add --cron "0 6 * * *" --prompt "Collect GitHub trending repos and send a summary" --desc "Daily GitHub Trending"
 	//   cc-connect cron add --cron "0 9 * * 1" --prompt "Generate a weekly project status report" --desc "Weekly Report"
 	//   cc-connect cron add --cron "*/2 * * * *" --exec "ipconfig" --session-mode new-per-run --desc "Every 2 min ipconfig"

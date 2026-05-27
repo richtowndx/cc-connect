@@ -16,26 +16,6 @@ import (
 	"github.com/chenhg5/cc-connect/core"
 )
 
-func TestNormalizeMode(t *testing.T) {
-	tests := []struct {
-		in   string
-		want string
-	}{
-		{"", "default"},
-		{"default", "default"},
-		{"yolo", "yolo"},
-		{"YOLO", "yolo"},
-		{"bypass", "yolo"},
-		{"auto-approve", "yolo"},
-		{"unknown", "default"},
-	}
-	for _, tt := range tests {
-		if got := normalizeMode(tt.in); got != tt.want {
-			t.Errorf("normalizeMode(%q) = %q, want %q", tt.in, got, tt.want)
-		}
-	}
-}
-
 func TestSummarizeToolArgs(t *testing.T) {
 	if got := summarizeToolArgs(nil); got != "" {
 		t.Fatalf("summarizeToolArgs(nil) = %q", got)
@@ -243,6 +223,27 @@ func TestPiAgent_SetModel_AppliesToNextSession(t *testing.T) {
 	_ = sessAny.Close()
 }
 
+func TestPiAgent_SetWorkDir_AppliesToNextSession(t *testing.T) {
+	workDir1 := t.TempDir()
+	workDir2 := t.TempDir()
+	a := newTestAgent(t, workDir1, map[string]string{
+		"PI_HELPER_EXPECT_CWD":     workDir2,
+		"PI_HELPER_SESSION_ID":     "sess-wd",
+		"PI_HELPER_NO_PROMPT_EXIT": "1",
+	})
+
+	a.SetWorkDir(workDir2)
+
+	sessAny, err := a.StartSession(context.Background(), "")
+	if err != nil {
+		t.Fatalf("StartSession error = %v", err)
+	}
+	defer sessAny.Close()
+
+	// Trigger a prompt so the helper validates CWD.
+	_ = sessAny.Send("hello", nil, nil)
+}
+
 func TestPiSession_ExtensionUIConfirm_RoundTrip(t *testing.T) {
 	workDir := t.TempDir()
 	a := newTestAgent(t, workDir, map[string]string{
@@ -329,6 +330,13 @@ func TestHelperProcess(t *testing.T) {
 	if exp := os.Getenv("PI_HELPER_EXPECT_MODEL"); exp != "" {
 		if modelArg != exp {
 			fmt.Fprintf(os.Stderr, "helper: --model = %q, want %q\n", modelArg, exp)
+			os.Exit(2)
+		}
+	}
+	if exp := os.Getenv("PI_HELPER_EXPECT_CWD"); exp != "" {
+		cwd, _ := os.Getwd()
+		if cwd != exp {
+			fmt.Fprintf(os.Stderr, "helper: cwd = %q, want %q\n", cwd, exp)
 			os.Exit(2)
 		}
 	}

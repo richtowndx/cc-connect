@@ -27,7 +27,6 @@ type Agent struct {
 	cmd        string // path to pi binary
 	workDir    string
 	model      string
-	mode       string // "default" | "yolo"
 	thinking   string // reasoning effort: off, minimal, low, medium, high, xhigh
 	sessionEnv []string
 	mu         sync.Mutex
@@ -39,8 +38,6 @@ func New(opts map[string]any) (core.Agent, error) {
 		workDir = "."
 	}
 	model, _ := opts["model"].(string)
-	mode, _ := opts["mode"].(string)
-	mode = normalizeMode(mode)
 
 	cmd, _ := opts["cmd"].(string)
 	if cmd == "" {
@@ -59,17 +56,7 @@ func New(opts map[string]any) (core.Agent, error) {
 		cmd:     cmd,
 		workDir: workDir,
 		model:   model,
-		mode:    mode,
 	}, nil
-}
-
-func normalizeMode(raw string) string {
-	switch strings.ToLower(strings.TrimSpace(raw)) {
-	case "yolo", "bypass", "auto-approve":
-		return "yolo"
-	default:
-		return "default"
-	}
 }
 
 func (a *Agent) Name() string           { return "pi" }
@@ -193,16 +180,21 @@ func (a *Agent) SetSessionEnv(env []string) {
 
 func (a *Agent) StartSession(ctx context.Context, sessionID string) (core.AgentSession, error) {
 	a.mu.Lock()
-	mode := a.mode
+	workDir := a.workDir
 	model := a.model
 	thinking := a.thinking
 	extraEnv := append([]string{}, a.sessionEnv...)
+	cmd := a.cmd
 	a.mu.Unlock()
-	return newPiSession(ctx, a.cmd, a.workDir, model, mode, thinking, sessionID, extraEnv)
+	return newPiSession(ctx, cmd, workDir, model, "", thinking, sessionID, extraEnv)
 }
 
 func (a *Agent) ListSessions(_ context.Context) ([]core.AgentSessionInfo, error) {
-	sessDir := piSessionDir(a.workDir)
+	a.mu.Lock()
+	workDir := a.workDir
+	a.mu.Unlock()
+
+	sessDir := piSessionDir(workDir)
 	if sessDir == "" {
 		return nil, nil
 	}
@@ -248,7 +240,11 @@ func (a *Agent) ListSessions(_ context.Context) ([]core.AgentSessionInfo, error)
 }
 
 func (a *Agent) DeleteSession(_ context.Context, sessionID string) error {
-	sessDir := piSessionDir(a.workDir)
+	a.mu.Lock()
+	workDir := a.workDir
+	a.mu.Unlock()
+
+	sessDir := piSessionDir(workDir)
 	if sessDir == "" {
 		return fmt.Errorf("pi: cannot determine session directory")
 	}
@@ -262,32 +258,14 @@ func (a *Agent) DeleteSession(_ context.Context, sessionID string) error {
 
 func (a *Agent) Stop() error { return nil }
 
-// ── ModeSwitcher ─────────────────────────────────────────────
-
-func (a *Agent) SetMode(mode string) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	a.mode = normalizeMode(mode)
-	slog.Info("pi: mode changed", "mode", a.mode)
-}
-
-func (a *Agent) GetMode() string {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	return a.mode
-}
-
-func (a *Agent) PermissionModes() []core.PermissionModeInfo {
-	return []core.PermissionModeInfo{
-		{Key: "default", Name: "Default", NameZh: "默认", Desc: "Standard permissions", DescZh: "标准权限模式"},
-		{Key: "yolo", Name: "YOLO", NameZh: "全自动", Desc: "Auto-approve all tool calls", DescZh: "自动批准所有工具调用"},
-	}
-}
-
 // ── MemoryFileProvider ───────────────────────────────────────
 
 func (a *Agent) ProjectMemoryFile() string {
-	absDir, err := filepath.Abs(a.workDir)
+	a.mu.Lock()
+	workDir := a.workDir
+	a.mu.Unlock()
+
+	absDir, err := filepath.Abs(workDir)
 	if err != nil {
 		absDir = a.workDir
 	}
@@ -323,12 +301,27 @@ func (a *Agent) AvailableReasoningEfforts() []string {
 
 // ── GetWorkDir (for /status display) ─────────────────────────
 
-func (a *Agent) GetWorkDir() string { return a.workDir }
+func (a *Agent) SetWorkDir(dir string) {
+	a.mu.Lock()
+	a.workDir = dir
+	a.mu.Unlock()
+	slog.Info("pi: work dir changed", "work_dir", dir)
+}
+
+func (a *Agent) GetWorkDir() string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.workDir
+}
 
 // ── HistoryProvider ──────────────────────────────────────────
 
 func (a *Agent) GetSessionHistory(_ context.Context, sessionID string, limit int) ([]core.HistoryEntry, error) {
-	sessDir := piSessionDir(a.workDir)
+	a.mu.Lock()
+	workDir := a.workDir
+	a.mu.Unlock()
+
+	sessDir := piSessionDir(workDir)
 	if sessDir == "" {
 		return nil, nil
 	}
@@ -344,7 +337,11 @@ func (a *Agent) GetSessionHistory(_ context.Context, sessionID string, limit int
 // ── SkillProvider ────────────────────────────────────────────
 
 func (a *Agent) SkillDirs() []string {
-	absDir, err := filepath.Abs(a.workDir)
+	a.mu.Lock()
+	workDir := a.workDir
+	a.mu.Unlock()
+
+	absDir, err := filepath.Abs(workDir)
 	if err != nil {
 		absDir = a.workDir
 	}

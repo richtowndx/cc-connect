@@ -571,6 +571,19 @@ func (s *piSession) handleExtensionUIRequest(env map[string]any) {
 	if id == "" || method == "" {
 		return
 	}
+
+	method = strings.TrimSpace(method)
+	// Per pi RPC spec, only dialog methods block and require a response.
+	// Fire-and-forget methods must NOT be translated into AskUserQuestion, otherwise
+	// cc-connect will block waiting for user input and the agent turn will stall.
+	switch method {
+	case "select", "confirm", "input", "editor":
+		// handled below
+	default:
+		// Fire-and-forget: notify/setStatus/setWidget/setTitle/set_editor_text/... — ignore.
+		return
+	}
+
 	title, _ := env["title"].(string)
 	msg, _ := env["message"].(string)
 	var options []string
@@ -603,10 +616,6 @@ func (s *piSession) handleExtensionUIRequest(env map[string]any) {
 		}
 	case "input", "editor":
 		// free-form: no options; engine will accept text.
-	default:
-		for _, opt := range options {
-			q.Options = append(q.Options, core.UserQuestionOption{Label: opt})
-		}
 	}
 
 	s.emit(core.Event{Type: core.EventPermissionRequest, ToolName: "AskUserQuestion", RequestID: id, ToolInput: q.Question, ToolInputRaw: map[string]any{"id": id, "method": method}, Questions: []core.UserQuestion{q}})

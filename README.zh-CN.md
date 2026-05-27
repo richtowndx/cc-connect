@@ -94,7 +94,7 @@
 ## ✨ 为什么选择 cc-connect？
 
 ### 🤖 通用 Agent 支持
-**7 大 AI Agent** — Claude Code、Codex、Cursor Agent、Qoder CLI、Gemini CLI、OpenCode、iFlow CLI。按需选用，或同时使用全部。
+**8 大 AI Agent** — Claude Code、Codex、Cursor Agent、Qoder CLI、Gemini CLI、OpenCode、iFlow CLI，以及 **Pi Coding Agent**。按需选用，或同时使用全部。
 
 ### 📱 平台灵活性
 **10 大聊天平台** — 飞书、钉钉、Slack、Telegram、Discord、企业微信、LINE、QQ、QQ 官方机器人，以及 **微信个人号（ilink）**。其中 **个人微信目前仅在 Beta / 预发布版本中提供**，需安装 `npm install -g cc-connect@beta` 或从 [GitHub Releases 预发布](https://github.com/chenhg5/cc-connect/releases) 下载带 beta 标签的包；**稳定版** npm 包**尚未**内置 `weixin` 平台。大部分平台**无需公网 IP**。
@@ -221,8 +221,13 @@ cc-connect update --pre     # Beta 版（含 pre-release）
 | Agent | Qoder CLI | ✅ 已支持 |
 | Agent | OpenCode (Crush) | ✅ 已支持 |
 | Agent | iFlow CLI | ✅ 已支持 |
+| Agent | Pi Coding Agent（`pi`） | ✅ 已支持 |
 | Agent | Goose (Block) | 🔜 计划中 |
 | Agent | Aider | 🔜 计划中 |
+
+> **Pi Coding Agent 安装**：`npm install -g @earendil-works/pi-coding-agent`。
+> 然后在项目里配置 `agent.type = "pi"`（可参考 `config.example.toml`）。
+
 | Platform | 飞书 (Lark) | ✅ WebSocket — 无需公网 IP |
 | Platform | 钉钉 | ✅ Stream — 无需公网 IP |
 | Platform | Telegram | ✅ Long Polling — 无需公网 IP |

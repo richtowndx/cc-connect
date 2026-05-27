@@ -94,7 +94,7 @@ High-level view of what each **built-in platform** can do in cc-connect. Inspire
 ## ✨ Why cc-connect?
 
 ### 🤖 Universal Agent Support
-**7 AI Agents** — Claude Code, Codex, Cursor Agent, Qoder CLI, Gemini CLI, OpenCode, iFlow CLI. Use whichever fits your workflow, or all of them at once.
+**8 AI Agents** — Claude Code, Codex, Cursor Agent, Qoder CLI, Gemini CLI, OpenCode, iFlow CLI, and **Pi Coding Agent**. Use whichever fits your workflow, or all of them at once.
 
 ### 📱 Platform Flexibility
 **10 Chat Platforms** — Feishu, DingTalk, Slack, Telegram, Discord, WeChat Work, LINE, QQ, QQ Bot (Official), plus **Weixin (personal ilink)** for **personal WeChat**. *Personal WeChat is **beta / pre-release only*** — install [`cc-connect@beta`](https://www.npmjs.com/package/cc-connect?activeTab=versions) or a [GitHub pre-release](https://github.com/chenhg5/cc-connect/releases) binary; the default **stable** npm package does **not** ship the `weixin` platform yet. Most platforms need **zero public IP**.
@@ -221,8 +221,12 @@ cc-connect update --pre     # Beta (includes pre-releases)
 | Agent | Qoder CLI | ✅ Supported |
 | Agent | OpenCode (Crush) | ✅ Supported |
 | Agent | iFlow CLI | ✅ Supported |
+| Agent | Pi Coding Agent (`pi`) | ✅ Supported |
 | Agent | Goose (Block) | 🔜 Planned |
 | Agent | Aider | 🔜 Planned |
+
+> **Pi Coding Agent install**: `npm install -g @earendil-works/pi-coding-agent`.
+> Configure a project with `agent.type = "pi"` (see `config.example.toml`).
 | Platform | Feishu (Lark) | ✅ WebSocket — no public IP needed |
 | Platform | DingTalk | ✅ Stream — no public IP needed |
 | Platform | Telegram | ✅ Long Polling — no public IP needed |

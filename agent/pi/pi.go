@@ -24,12 +24,16 @@ func init() {
 
 // Agent drives the pi coding agent CLI in RPC mode (`pi --mode rpc`).
 type Agent struct {
-	cmd        string // path to pi binary
-	workDir    string
-	model      string
-	thinking   string // reasoning effort: off, minimal, low, medium, high, xhigh
-	sessionEnv []string
-	mu         sync.Mutex
+	cmd      string // path to pi binary
+	workDir  string
+	model    string
+	thinking string // reasoning effort: off, minimal, low, medium, high, xhigh
+	// If true, when cc-connect doesn't have a persisted session ID yet, start
+	// with pi's --continue semantics (resume latest session in workDir).
+	// WARNING: this may merge contexts across different cc-connect sessions that share the same workDir.
+	continueOnEmpty bool
+	sessionEnv      []string
+	mu              sync.Mutex
 }
 
 func New(opts map[string]any) (core.Agent, error) {
@@ -38,6 +42,12 @@ func New(opts map[string]any) (core.Agent, error) {
 		workDir = "."
 	}
 	model, _ := opts["model"].(string)
+	continueOnEmpty := false
+	if v, ok := opts["continue"].(bool); ok {
+		continueOnEmpty = v
+	} else if v, ok := opts["continue"].(string); ok {
+		continueOnEmpty = strings.EqualFold(strings.TrimSpace(v), "true") || strings.TrimSpace(v) == "1"
+	}
 
 	cmd, _ := opts["cmd"].(string)
 	if cmd == "" {
@@ -53,9 +63,10 @@ func New(opts map[string]any) (core.Agent, error) {
 	}
 
 	return &Agent{
-		cmd:     cmd,
-		workDir: workDir,
-		model:   model,
+		cmd:             cmd,
+		workDir:         workDir,
+		model:           model,
+		continueOnEmpty: continueOnEmpty,
 	}, nil
 }
 
@@ -185,8 +196,12 @@ func (a *Agent) StartSession(ctx context.Context, sessionID string) (core.AgentS
 	thinking := a.thinking
 	extraEnv := append([]string{}, a.sessionEnv...)
 	cmd := a.cmd
+	continueOnEmpty := a.continueOnEmpty
 	a.mu.Unlock()
-	return newPiSession(ctx, cmd, workDir, model, "", thinking, sessionID, extraEnv)
+	if strings.TrimSpace(sessionID) == "" && continueOnEmpty {
+		sessionID = core.ContinueSession
+	}
+	return newPiJSONSession(ctx, cmd, workDir, model, thinking, sessionID, extraEnv)
 }
 
 func (a *Agent) ListSessions(_ context.Context) ([]core.AgentSessionInfo, error) {

@@ -8,7 +8,6 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -51,7 +50,7 @@ func newTestAgent(t *testing.T, workDir string, extraEnv map[string]string) *Age
 	// all pi args after "--".
 	wrapper := filepath.Join(workDir, "pi-helper.sh")
 	wrapperBody := "#!/bin/sh\n" +
-		"exec \"" + os.Args[0] + "\" -test.run TestHelperProcess -test.v -- \"$@\"\n"
+		"exec \"" + os.Args[0] + "\" -test.run TestHelperProcess -- \"$@\"\n"
 	if err := os.WriteFile(wrapper, []byte(wrapperBody), 0o755); err != nil {
 		t.Fatalf("write wrapper: %v", err)
 	}
@@ -87,7 +86,7 @@ func drainFor(d time.Duration, ch <-chan core.Event) {
 	}
 }
 
-func TestPiSession_RPCPromptFlow(t *testing.T) {
+func TestPiSession_JSONPromptFlow(t *testing.T) {
 	workDir := t.TempDir()
 	a := newTestAgent(t, workDir, map[string]string{
 		"PI_HELPER_SESSION_ID": "sess-123",
@@ -150,43 +149,6 @@ func TestPiSession_RPCPromptFlow(t *testing.T) {
 	}
 }
 
-func TestPiSession_AutoRestartAfterExit(t *testing.T) {
-	workDir := t.TempDir()
-	counterFile := filepath.Join(workDir, "counter.txt")
-	a := newTestAgent(t, workDir, map[string]string{
-		"PI_HELPER_SESSION_ID":              "sess-r",
-		"PI_HELPER_COUNTER_FILE":            counterFile,
-		"PI_HELPER_EXIT_AFTER_STATE_ONCE":   "1",
-		"PI_HELPER_EXIT_AFTER_STATE_SIGNAL": "SIGTERM",
-	})
-
-	sessAny, err := a.StartSession(context.Background(), "")
-	if err != nil {
-		t.Fatalf("StartSession error = %v", err)
-	}
-	defer sessAny.Close()
-
-	// First helper run exits after get_state; it may have emitted exit error/result.
-	drainFor(50*time.Millisecond, sessAny.Events())
-
-	if err := sessAny.Send("hello", nil, nil); err != nil {
-		t.Fatalf("Send error = %v", err)
-	}
-
-	timer := time.NewTimer(2 * time.Second)
-	defer timer.Stop()
-	for {
-		select {
-		case <-timer.C:
-			t.Fatal("timeout waiting for EventResult")
-		case ev := <-sessAny.Events():
-			if ev.Type == core.EventResult {
-				return
-			}
-		}
-	}
-}
-
 func TestPiAgent_AvailableModels_RPC(t *testing.T) {
 	workDir := t.TempDir()
 	modelsJSON := `[
@@ -213,6 +175,7 @@ func TestPiAgent_SetModel_AppliesToNextSession(t *testing.T) {
 	workDir := t.TempDir()
 	a := newTestAgent(t, workDir, map[string]string{
 		"PI_HELPER_EXPECT_MODEL": "openai/gpt-4.1",
+		"PI_HELPER_SESSION_ID":   "sess-model",
 	})
 	a.SetModel("openai/gpt-4.1")
 
@@ -220,7 +183,12 @@ func TestPiAgent_SetModel_AppliesToNextSession(t *testing.T) {
 	if err != nil {
 		t.Fatalf("StartSession error = %v", err)
 	}
-	_ = sessAny.Close()
+	defer sessAny.Close()
+
+	// Trigger a prompt so the helper validates --model.
+	if err := sessAny.Send("hello", nil, nil); err != nil {
+		t.Fatalf("Send error = %v", err)
+	}
 }
 
 func TestPiAgent_SetWorkDir_AppliesToNextSession(t *testing.T) {
@@ -244,67 +212,6 @@ func TestPiAgent_SetWorkDir_AppliesToNextSession(t *testing.T) {
 	_ = sessAny.Send("hello", nil, nil)
 }
 
-func TestPiSession_ExtensionUIConfirm_RoundTrip(t *testing.T) {
-	workDir := t.TempDir()
-	a := newTestAgent(t, workDir, map[string]string{
-		"PI_HELPER_SESSION_ID":      "sess-ui",
-		"PI_HELPER_EXTENSION_UI":    "confirm",
-		"PI_HELPER_EXTENSION_UI_ID": "ui-1",
-	})
-
-	sessAny, err := a.StartSession(context.Background(), "")
-	if err != nil {
-		t.Fatalf("StartSession error = %v", err)
-	}
-	defer sessAny.Close()
-
-	if err := sessAny.Send("trigger ui", nil, nil); err != nil {
-		t.Fatalf("Send error = %v", err)
-	}
-
-	var req *core.Event
-	timer := time.NewTimer(2 * time.Second)
-	defer timer.Stop()
-	for req == nil {
-		select {
-		case <-timer.C:
-			t.Fatal("timeout waiting for permission request")
-		case ev := <-sessAny.Events():
-			if ev.Type == core.EventPermissionRequest {
-				tmp := ev
-				req = &tmp
-			}
-		}
-	}
-
-	if req.RequestID != "ui-1" {
-		t.Fatalf("RequestID = %q, want ui-1", req.RequestID)
-	}
-	if req.ToolName != "AskUserQuestion" {
-		t.Fatalf("ToolName = %q, want AskUserQuestion", req.ToolName)
-	}
-
-	// Simulate engine AskUserQuestion response: answers["0"] contains the selection.
-	_ = sessAny.RespondPermission(req.RequestID, core.PermissionResult{
-		Behavior: "allow",
-		UpdatedInput: map[string]any{
-			"answers": map[string]any{"0": "Yes"},
-		},
-	})
-
-	// Now expect EventResult.
-	for {
-		select {
-		case <-timer.C:
-			t.Fatal("timeout waiting for EventResult")
-		case ev := <-sessAny.Events():
-			if ev.Type == core.EventResult {
-				return
-			}
-		}
-	}
-}
-
 // --- Helper process (fake `pi --mode rpc`) ---
 
 func TestHelperProcess(t *testing.T) {
@@ -312,21 +219,25 @@ func TestHelperProcess(t *testing.T) {
 		return
 	}
 
-	// Minimal arg check.
-	hasRPC := false
+	mode := ""
 	modelArg := ""
+	sessionArg := ""
+	hasContinue := false
 	for i := 0; i < len(os.Args); i++ {
-		if os.Args[i] == "--mode" && i+1 < len(os.Args) && os.Args[i+1] == "rpc" {
-			hasRPC = true
+		if os.Args[i] == "--mode" && i+1 < len(os.Args) {
+			mode = os.Args[i+1]
 		}
 		if os.Args[i] == "--model" && i+1 < len(os.Args) {
 			modelArg = os.Args[i+1]
 		}
+		if os.Args[i] == "--session" && i+1 < len(os.Args) {
+			sessionArg = os.Args[i+1]
+		}
+		if os.Args[i] == "--continue" || os.Args[i] == "-c" {
+			hasContinue = true
+		}
 	}
-	if !hasRPC {
-		fmt.Fprintln(os.Stderr, "helper: missing --mode rpc")
-		os.Exit(2)
-	}
+
 	if exp := os.Getenv("PI_HELPER_EXPECT_MODEL"); exp != "" {
 		if modelArg != exp {
 			fmt.Fprintf(os.Stderr, "helper: --model = %q, want %q\n", modelArg, exp)
@@ -341,39 +252,37 @@ func TestHelperProcess(t *testing.T) {
 		}
 	}
 
-	sessionID := os.Getenv("PI_HELPER_SESSION_ID")
+	sessionID := strings.TrimSpace(sessionArg)
+	if sessionID == "" {
+		sessionID = strings.TrimSpace(os.Getenv("PI_HELPER_SESSION_ID"))
+	}
 	if sessionID == "" {
 		sessionID = "sess-default"
 	}
 
-	counterFile := os.Getenv("PI_HELPER_COUNTER_FILE")
-	exitAfterStateOnce := os.Getenv("PI_HELPER_EXIT_AFTER_STATE_ONCE") == "1"
-	extUI := os.Getenv("PI_HELPER_EXTENSION_UI")
-	extUIID := os.Getenv("PI_HELPER_EXTENSION_UI_ID")
-	if extUIID == "" {
-		extUIID = "ui-1"
+	// --- JSON mode: single-shot print-mode output ---
+	if mode == "json" {
+		enc := json.NewEncoder(os.Stdout)
+		cwd, _ := os.Getwd()
+		_ = enc.Encode(map[string]any{"type": "session", "id": sessionID, "timestamp": time.Now().UTC().Format(time.RFC3339Nano), "cwd": cwd})
+		// Simulate a normal turn.
+		_ = enc.Encode(map[string]any{"type": "agent_start"})
+		_ = enc.Encode(map[string]any{"type": "message_update", "assistantMessageEvent": map[string]any{"type": "text_delta", "delta": "Hello from helper"}})
+		_ = enc.Encode(map[string]any{"type": "tool_execution_start", "toolName": "bash", "args": map[string]any{"command": "echo hi"}})
+		_ = enc.Encode(map[string]any{"type": "tool_execution_end", "toolName": "bash", "isError": false, "result": map[string]any{"content": []any{map[string]any{"type": "text", "text": "ok"}}}})
+		_ = enc.Encode(map[string]any{"type": "agent_end", "messages": []any{map[string]any{"role": "assistant", "content": []any{map[string]any{"type": "text", "text": "Hello from helper"}}, "usage": map[string]any{"input": 123, "output": 45}}}})
+		_ = hasContinue // silence unused; only here to prove parsing works.
+		os.Exit(0)
 	}
 
-	incCounter := func() int {
-		if counterFile == "" {
-			return 1
-		}
-		b, _ := os.ReadFile(counterFile)
-		n := 0
-		if len(b) > 0 {
-			if v, err := strconv.Atoi(strings.TrimSpace(string(b))); err == nil {
-				n = v
-			}
-		}
-		n++
-		_ = os.WriteFile(counterFile, []byte(strconv.Itoa(n)), 0o644)
-		return n
+	// --- RPC mode: used by AvailableModels() helper ---
+	if mode != "rpc" {
+		fmt.Fprintf(os.Stderr, "helper: expected --mode rpc or --mode json, got %q\n", mode)
+		os.Exit(2)
 	}
 
 	r := bufio.NewReader(os.Stdin)
 	enc := json.NewEncoder(os.Stdout)
-
-	runNum := incCounter()
 
 	for {
 		lineBytes, err := r.ReadBytes('\n')
@@ -410,12 +319,7 @@ func TestHelperProcess(t *testing.T) {
 		switch typ {
 		case "get_state":
 			sendResp("get_state", true, map[string]any{"sessionId": sessionID, "isStreaming": false}, "")
-			if exitAfterStateOnce && runNum == 1 {
-				os.Exit(0)
-			}
-
 		case "get_available_models":
-			// Used by Agent.AvailableModels().
 			raw := os.Getenv("PI_HELPER_MODELS_JSON")
 			var models any
 			if raw != "" {
@@ -425,41 +329,6 @@ func TestHelperProcess(t *testing.T) {
 				models = []any{}
 			}
 			sendResp("get_available_models", true, map[string]any{"models": models}, "")
-
-		case "prompt":
-			sendResp("prompt", true, nil, "")
-			if os.Getenv("PI_HELPER_NO_PROMPT_EXIT") == "1" {
-				os.Exit(0)
-			}
-
-			// Optional extension UI dialog
-			if extUI == "confirm" {
-				_ = enc.Encode(map[string]any{"type": "extension_ui_request", "id": extUIID, "method": "confirm", "title": "Confirm?", "message": "Proceed?"})
-				// Wait for extension_ui_response
-				for {
-					l2, err := r.ReadBytes('\n')
-					if err != nil {
-						os.Exit(0)
-					}
-					l2s := strings.TrimSuffix(string(l2), "\n")
-					l2s = strings.TrimSuffix(l2s, "\r")
-					var resp map[string]any
-					if json.Unmarshal([]byte(l2s), &resp) != nil {
-						continue
-					}
-					if resp["type"] == "extension_ui_response" && resp["id"] == extUIID {
-						break
-					}
-				}
-			}
-
-			// Stream events
-			_ = enc.Encode(map[string]any{"type": "agent_start"})
-			_ = enc.Encode(map[string]any{"type": "message_update", "assistantMessageEvent": map[string]any{"type": "text_delta", "delta": "Hello from helper"}})
-			_ = enc.Encode(map[string]any{"type": "tool_execution_start", "toolName": "bash", "args": map[string]any{"command": "echo hi"}})
-			_ = enc.Encode(map[string]any{"type": "tool_execution_end", "toolName": "bash", "isError": false, "result": map[string]any{"content": []any{map[string]any{"type": "text", "text": "ok"}}}})
-			_ = enc.Encode(map[string]any{"type": "agent_end", "messages": []any{map[string]any{"role": "assistant", "content": []any{map[string]any{"type": "text", "text": "Hello from helper"}}, "usage": map[string]any{"input": 123, "output": 45}}}})
-
 		default:
 			sendResp(typ, false, nil, "unknown command")
 		}

@@ -22,12 +22,30 @@ func init() {
 	core.RegisterAgent("pi", New)
 }
 
-// Agent drives the pi coding agent CLI in RPC mode (`pi --mode rpc`).
+// Agent drives the pi coding agent CLI.
+//
+// Two execution modes are supported:
+//
+//   - "rpc" (default): runs a persistent `pi --mode rpc` subprocess and multiplexes
+//     multi-turn conversations over JSONL on stdin/stdout. This is the recommended
+//     mode for complex agent tasks — it supports streaming, abort, extension UI
+//     dialogs, auto-retry, compaction, and all upstream pi features.
+//
+//   - "json": single-shot `pi --mode json` per Send. Simpler but cannot handle
+//     extension UI dialogs, complex tool chains, or auto-retry. Kept as a
+//     fallback for older pi versions or restricted environments.
+//
+// The execution mode is selected via the `exec_mode` option in
+// [projects.agent.options]. We deliberately do NOT read the generic `mode` key —
+// that key is reserved for permission modes (default/acceptEdits/yolo/...) by
+// convention across all cc-connect agents. pi does not currently support
+// permission modes, so `mode` is silently ignored.
 type Agent struct {
 	cmd      string // path to pi binary
 	workDir  string
 	model    string
 	thinking string // reasoning effort: off, minimal, low, medium, high, xhigh
+	mode     string // "rpc" (default) or "json"
 	// If true, when cc-connect doesn't have a persisted session ID yet, start
 	// with pi's --continue semantics (resume latest session in workDir).
 	// WARNING: this may merge contexts across different cc-connect sessions that share the same workDir.
@@ -58,6 +76,14 @@ func New(opts map[string]any) (core.Agent, error) {
 		cmd = "pi"
 	}
 
+	mode := strings.ToLower(strings.TrimSpace(fmt.Sprintf("%v", opts["exec_mode"])))
+	if mode == "" || mode == "<nil>" {
+		mode = "rpc"
+	}
+	if mode != "rpc" && mode != "json" {
+		return nil, fmt.Errorf("pi: invalid exec_mode %q (must be \"rpc\" or \"json\")", mode)
+	}
+
 	if _, err := exec.LookPath(cmd); err != nil {
 		return nil, fmt.Errorf("pi: %q not found in PATH, install with: npm install -g @earendil-works/pi-coding-agent", cmd)
 	}
@@ -66,6 +92,7 @@ func New(opts map[string]any) (core.Agent, error) {
 		cmd:             cmd,
 		workDir:         workDir,
 		model:           model,
+		mode:            mode,
 		continueOnEmpty: continueOnEmpty,
 	}, nil
 }
@@ -194,6 +221,7 @@ func (a *Agent) StartSession(ctx context.Context, sessionID string) (core.AgentS
 	workDir := a.workDir
 	model := a.model
 	thinking := a.thinking
+	mode := a.mode
 	extraEnv := append([]string{}, a.sessionEnv...)
 	cmd := a.cmd
 	continueOnEmpty := a.continueOnEmpty
@@ -201,7 +229,10 @@ func (a *Agent) StartSession(ctx context.Context, sessionID string) (core.AgentS
 	if strings.TrimSpace(sessionID) == "" && continueOnEmpty {
 		sessionID = core.ContinueSession
 	}
-	return newPiJSONSession(ctx, cmd, workDir, model, thinking, sessionID, extraEnv)
+	if mode == "json" {
+		return newPiJSONSession(ctx, cmd, workDir, model, thinking, sessionID, extraEnv)
+	}
+	return newPiSession(ctx, cmd, workDir, model, thinking, sessionID, extraEnv)
 }
 
 func (a *Agent) ListSessions(_ context.Context) ([]core.AgentSessionInfo, error) {
@@ -321,6 +352,16 @@ func (a *Agent) SetWorkDir(dir string) {
 	a.workDir = dir
 	a.mu.Unlock()
 	slog.Info("pi: work dir changed", "work_dir", dir)
+}
+
+func (a *Agent) SetMode(mode string) {
+	m := strings.ToLower(strings.TrimSpace(mode))
+	if m == "" {
+		m = "rpc"
+	}
+	a.mu.Lock()
+	a.mode = m
+	a.mu.Unlock()
 }
 
 func (a *Agent) GetWorkDir() string {

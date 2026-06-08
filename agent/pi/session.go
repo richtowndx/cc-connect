@@ -75,7 +75,7 @@ type extUIRequest struct {
 	Options []string
 }
 
-func newPiSession(ctx context.Context, cmd, workDir, model, _mode, thinking, resumeID string, extraEnv []string) (*piSession, error) {
+func newPiSession(ctx context.Context, cmd, workDir, model, thinking, resumeID string, extraEnv []string) (*piSession, error) {
 	sessionCtx, cancel := context.WithCancel(ctx)
 	s := &piSession{
 		cmd:       cmd,
@@ -484,6 +484,15 @@ func (s *piSession) Close() error {
 }
 
 // handleRPCEvent maps pi RPC stdout events into cc-connect core.Events.
+//
+// Reference: pi-desktop AgentManager.handlePiEvent + pi 0.78+ RPC protocol.
+//
+// Key differences from older pi versions:
+//   - agent_end carries willRetry=true when an auto-retry is scheduled. In that
+//     case we must NOT emit EventResult — another agent_start will follow.
+//   - message_update now has text_start/text_end, thinking_start, toolcall_*
+//     sub-events. The new ones are informational; only *_delta carries data.
+//   - extension_error and auto_retry_* / compaction_* lifecycle events exist.
 func (s *piSession) handleRPCEvent(env map[string]any) {
 	typ, _ := env["type"].(string)
 
@@ -496,6 +505,21 @@ func (s *piSession) handleRPCEvent(env map[string]any) {
 
 	case "agent_end":
 		s.streaming.Store(false)
+
+		// willRetry: pi auto-retry will fire another agent_start. Hold off
+		// finalizing the cc-connect turn until the retry completes.
+		if willRetry, _ := env["willRetry"].(bool); willRetry {
+			if msg := buildRetryThinkingMessage(env); msg != "" {
+				s.emit(core.Event{Type: core.EventThinking, Content: msg})
+			}
+			return
+		}
+
+		// Surface an error if pi reported one.
+		if errMsg := extractAgentEndError(env); errMsg != "" {
+			s.emit(core.Event{Type: core.EventError, Error: fmt.Errorf("pi: %s", errMsg)})
+		}
+
 		// Emit EventResult to end this turn.
 		content := ""
 		s.turnMu.Lock()
@@ -532,8 +556,51 @@ func (s *piSession) handleRPCEvent(env map[string]any) {
 	case "extension_ui_request":
 		s.handleExtensionUIRequest(env)
 
+	case "tool_execution_update":
+		// Pi streams partial output for long-running tools (notably bash).
+		// Forward a trimmed version as EventThinking so the user sees real-time
+		// progress — without this, a 30s `go test` looks identical to a hung agent.
+		partial, _ := env["partialResult"].(map[string]any)
+		if partial != nil {
+			if txt := strings.TrimSpace(extractToolResultText(partial)); txt != "" {
+				s.emit(core.Event{Type: core.EventThinking, Content: truncStr(txt, 400)})
+			}
+		}
+
+	case "extension_error":
+		errMsg, _ := env["error"].(string)
+		if errMsg == "" {
+			errMsg = "extension error"
+		}
+		s.emit(core.Event{Type: core.EventError, Error: fmt.Errorf("pi: %s", errMsg)})
+
+	case "auto_retry_start":
+		// Show retry attempts as thinking so the user knows the agent hasn't
+		// stalled. Without this, a slow retry looks identical to a hung turn.
+		attempt, _ := env["attempt"].(float64)
+		maxAttempts, _ := env["maxAttempts"].(float64)
+		errMsg, _ := env["errorMessage"].(string)
+		msg := fmt.Sprintf("auto-retry %d/%d", int(attempt), int(maxAttempts))
+		if errMsg != "" {
+			msg += ": " + truncStr(errMsg, 200)
+		}
+		s.emit(core.Event{Type: core.EventThinking, Content: msg})
+
+	case "auto_retry_end":
+		// No special action; agent_end will follow.
+
+	case "compaction_start":
+		s.emit(core.Event{Type: core.EventThinking, Content: "compacting context…"})
+
+	case "compaction_end":
+		// Compaction is informational; the next agent_end will close the turn.
+		if errMsg, _ := env["errorMessage"].(string); errMsg != "" {
+			s.emit(core.Event{Type: core.EventError, Error: fmt.Errorf("pi: compaction failed: %s", errMsg)})
+		}
+
 	default:
-		// ignore other lifecycle events
+		// ignore other lifecycle events (turn_start/end, message_start/end,
+		// tool_execution_update, queue_update, session_info_changed, …)
 	}
 }
 
@@ -544,6 +611,8 @@ func (s *piSession) handleMessageUpdate(env map[string]any) {
 	}
 	st, _ := ame["type"].(string)
 	switch st {
+	case "text_start", "text_end":
+		// Informational boundary events; nothing to emit.
 	case "text_delta":
 		delta, _ := ame["delta"].(string)
 		if delta != "" {
@@ -552,15 +621,35 @@ func (s *piSession) handleMessageUpdate(env map[string]any) {
 			s.turnMu.Unlock()
 			s.emit(core.Event{Type: core.EventText, Content: delta})
 		}
+	case "thinking_start":
+		// Reset accumulator for a new thinking block.
+		s.thinkingBuf.Reset()
 	case "thinking_delta":
 		delta, _ := ame["delta"].(string)
 		if delta != "" {
 			s.thinkingBuf.WriteString(delta)
 		}
 	case "thinking_end":
-		if s.thinkingBuf.Len() > 0 {
-			s.emit(core.Event{Type: core.EventThinking, Content: s.thinkingBuf.String()})
-			s.thinkingBuf.Reset()
+		// `content` may carry the final thinking text; fall back to accumulated deltas.
+		final := ""
+		if c, ok := ame["content"].(string); ok {
+			final = c
+		}
+		if final == "" && s.thinkingBuf.Len() > 0 {
+			final = s.thinkingBuf.String()
+		}
+		s.thinkingBuf.Reset()
+		if final != "" {
+			s.emit(core.Event{Type: core.EventThinking, Content: stripAnsi(final)})
+		}
+	case "toolcall_start", "toolcall_delta", "toolcall_end":
+		// Inline tool-call metadata streamed before tool_execution_start fires.
+		// We don't surface these to avoid duplicating the eventual
+		// tool_execution_start event, which carries the canonical name+args.
+	case "error":
+		reason, _ := ame["reason"].(string)
+		if reason := strings.TrimSpace(reason); reason != "" {
+			s.emit(core.Event{Type: core.EventError, Error: fmt.Errorf("pi: %s", reason)})
 		}
 	}
 }
@@ -679,6 +768,110 @@ func extractAssistantTextFromAgentEnd(env map[string]any) (string, bool) {
 		return out, out != ""
 	}
 	return "", false
+}
+
+// extractAgentEndError mirrors pi-desktop's AgentManager.handlePiEvent error
+// extraction cascade: top-level errorMessage → last message with stopReason=error →
+// top-level error → last assistant content block of type=error.
+// Returns "" when the agent ended cleanly.
+func extractAgentEndError(env map[string]any) string {
+	stopReason, _ := env["stopReason"].(string)
+
+	if msg, _ := env["errorMessage"].(string); strings.TrimSpace(msg) != "" {
+		return strings.TrimSpace(msg)
+	}
+
+	msgsAny, _ := env["messages"].([]any)
+	// Scan for messages explicitly marked as error stops.
+	for i := len(msgsAny) - 1; i >= 0; i-- {
+		m, _ := msgsAny[i].(map[string]any)
+		if m == nil {
+			continue
+		}
+		sr, _ := m["stopReason"].(string)
+		if sr != "error" {
+			continue
+		}
+		if msg, _ := m["errorMessage"].(string); strings.TrimSpace(msg) != "" {
+			return strings.TrimSpace(msg)
+		}
+	}
+
+	if msg, _ := env["error"].(string); strings.TrimSpace(msg) != "" {
+		return strings.TrimSpace(msg)
+	}
+
+	// Last assistant message's type=error content block.
+	for i := len(msgsAny) - 1; i >= 0; i-- {
+		m, _ := msgsAny[i].(map[string]any)
+		if m == nil {
+			continue
+		}
+		role, _ := m["role"].(string)
+		if role != "assistant" {
+			continue
+		}
+		content, _ := m["content"].([]any)
+		for _, c := range content {
+			item, _ := c.(map[string]any)
+			if item == nil {
+				continue
+			}
+			if typ, _ := item["type"].(string); typ == "error" {
+				if t, _ := item["text"].(string); strings.TrimSpace(t) != "" {
+					return strings.TrimSpace(t)
+				}
+				if t, _ := item["message"].(string); strings.TrimSpace(t) != "" {
+					return strings.TrimSpace(t)
+				}
+			}
+		}
+	}
+
+	if stopReason == "error" {
+		return "agent returned unknown error"
+	}
+	return ""
+}
+
+// buildRetryThinkingMessage produces a short status string for an agent_end
+// with willRetry=true, so the user understands why the turn hasn't finalized.
+func buildRetryThinkingMessage(env map[string]any) string {
+	if msg := extractAgentEndError(env); msg != "" {
+		return "retrying after error: " + truncStr(msg, 200)
+	}
+	return "agent will retry…"
+}
+
+// stripAnsi removes ANSI escape sequences (terminal colors) from streaming
+// thinking text. Models occasionally emit these; sending them to chat platforms
+// produces ugly output.
+func stripAnsi(s string) string {
+	var sb strings.Builder
+	runes := []rune(s)
+	for i := 0; i < len(runes); i++ {
+		if runes[i] != 0x1b {
+			sb.WriteRune(runes[i])
+			continue
+		}
+		// Skip `ESC [ params final-letter`.
+		i++
+		if i >= len(runes) || runes[i] != '[' {
+			// Not a valid CSI sequence; emit the ESC and continue.
+			i-- // Reset to the ESC position (will be incremented after continue)
+			continue
+		}
+		i++
+		for i < len(runes) {
+			r := runes[i]
+			i++
+			if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') {
+				break
+			}
+		}
+		i-- // Backtrack one step (the final character was already consumed)
+	}
+	return sb.String()
 }
 
 func extractTokensFromAgentEnd(env map[string]any) (int, int) {

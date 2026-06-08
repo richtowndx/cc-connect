@@ -56,32 +56,43 @@ type rpcTransport struct {
 
 	nextID atomic.Int64
 
-	pendingMu sync.Mutex
-	pending   map[string]chan rpcOutcome
+	pending sync.Map // map[string]chan rpcOutcome
 
 	onEvent rpcEventHandler
 }
 
 func newRPCTransport(in io.Reader, out io.Writer, onEvent rpcEventHandler) *rpcTransport {
+	enc := json.NewEncoder(out)
+	// We never emit HTML; disabling HTML escaping saves a few CPU cycles per
+	// prompt command and avoids surprising output in tool args.
+	enc.SetEscapeHTML(false)
 	return &rpcTransport{
-		in:      bufio.NewReader(in),
+		in:      bufio.NewReaderSize(in, 64*1024),
 		out:     out,
-		enc:     json.NewEncoder(out),
-		pending: make(map[string]chan rpcOutcome),
+		enc:     enc,
 		onEvent: onEvent,
 	}
 }
 
 func (t *rpcTransport) readLoop(ctx context.Context) {
 	for {
-		select {
-		case <-ctx.Done():
+		// Check cancellation up front so a closed context can break the loop
+		// even if the underlying read is blocked.
+		if ctx.Err() != nil {
 			return
-		default:
 		}
 		line, err := t.readLine(ctx)
 		if err != nil {
-			t.cancelAll(fmt.Errorf("pi: rpc read closed: %w", err))
+			if errors.Is(err, errLineTooLong) {
+				// One record exceeded the size cap. readLine has already
+				// drained up to the next newline, so framing is intact;
+				// just log and move on.
+				slog.Warn("pi: dropped oversized rpc line", "limit", 16*1024*1024)
+				continue
+			}
+			if ctx.Err() == nil {
+				t.cancelAll(fmt.Errorf("pi: rpc read closed: %w", err))
+			}
 			return
 		}
 		if len(bytes.TrimSpace(line)) == 0 {
@@ -114,6 +125,12 @@ func (t *rpcTransport) readLoop(ctx context.Context) {
 	}
 }
 
+// errLineTooLong is returned by readLine when a single JSONL record exceeds
+// the safety limit. The caller (readLoop) treats it as a recoverable error:
+// the oversized line is already drained from the buffer, so transport can
+// skip it and continue parsing the next record.
+var errLineTooLong = fmt.Errorf("pi: rpc line too long")
+
 func (t *rpcTransport) readLine(ctx context.Context) ([]byte, error) {
 	// Prevent unbounded memory growth if the subprocess emits an extremely large JSONL record.
 	// Large tool outputs should be written to files and referenced instead.
@@ -123,11 +140,14 @@ func (t *rpcTransport) readLine(ctx context.Context) ([]byte, error) {
 	for {
 		frag, err := t.in.ReadSlice('\n')
 		if len(line)+len(frag) > maxLine {
-			// Drain until the next newline to re-sync framing, then fail.
+			// Drain until the next newline to re-sync framing, then return a
+			// recoverable error so readLoop skips this record and continues
+			// with subsequent ones — a single oversized line must NOT tear
+			// down the entire RPC transport.
 			for err == bufio.ErrBufferFull {
 				_, err = t.in.ReadSlice('\n')
 			}
-			return nil, fmt.Errorf("pi: rpc line too long (> %d bytes)", maxLine)
+			return nil, errLineTooLong
 		}
 		line = append(line, frag...)
 		if err == nil {
@@ -159,14 +179,12 @@ func jsonIDKey(id json.RawMessage) string {
 
 func (t *rpcTransport) completePending(id json.RawMessage, resp *rpcResponse) {
 	key := jsonIDKey(id)
-	t.pendingMu.Lock()
-	ch, ok := t.pending[key]
-	delete(t.pending, key)
-	t.pendingMu.Unlock()
+	v, ok := t.pending.LoadAndDelete(key)
 	if !ok {
 		slog.Debug("pi: unmatched rpc response", "id", key, "command", resp.Command)
 		return
 	}
+	ch := v.(chan rpcOutcome)
 	select {
 	case ch <- rpcOutcome{resp: resp}:
 	default:
@@ -174,15 +192,15 @@ func (t *rpcTransport) completePending(id json.RawMessage, resp *rpcResponse) {
 }
 
 func (t *rpcTransport) cancelAll(err error) {
-	t.pendingMu.Lock()
-	defer t.pendingMu.Unlock()
-	for k, ch := range t.pending {
+	t.pending.Range(func(k, v any) bool {
+		ch := v.(chan rpcOutcome)
 		select {
 		case ch <- rpcOutcome{err: err}:
 		default:
 		}
-		delete(t.pending, k)
-	}
+		t.pending.Delete(k)
+		return true
+	})
 }
 
 func (t *rpcTransport) call(ctx context.Context, cmd map[string]any) (*rpcResponse, error) {
@@ -191,22 +209,16 @@ func (t *rpcTransport) call(ctx context.Context, cmd map[string]any) (*rpcRespon
 	cmd["id"] = key
 
 	ch := make(chan rpcOutcome, 1)
-	t.pendingMu.Lock()
-	t.pending[key] = ch
-	t.pendingMu.Unlock()
+	t.pending.Store(key, ch)
 
 	if err := t.writeJSON(cmd); err != nil {
-		t.pendingMu.Lock()
-		delete(t.pending, key)
-		t.pendingMu.Unlock()
+		t.pending.Delete(key)
 		return nil, fmt.Errorf("pi: rpc write: %w", err)
 	}
 
 	select {
 	case <-ctx.Done():
-		t.pendingMu.Lock()
-		delete(t.pending, key)
-		t.pendingMu.Unlock()
+		t.pending.Delete(key)
 		return nil, ctx.Err()
 	case out := <-ch:
 		if out.err != nil {

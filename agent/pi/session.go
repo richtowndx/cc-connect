@@ -45,6 +45,7 @@ type piSession struct {
 
 	alive     atomic.Bool
 	streaming atomic.Bool
+	textSeen  atomic.Bool
 
 	procMu     sync.Mutex
 	proc       *exec.Cmd
@@ -58,14 +59,42 @@ type piSession struct {
 	sessionMu sync.RWMutex
 	sessionID string
 
-	turnMu   sync.Mutex
-	textSeen bool
-
 	thinkingBuf strings.Builder
 
 	extMu     sync.Mutex
 	extUIReqs map[string]extUIRequest
+
+	// done is closed by Close() exactly once. emit() checks/sends on done
+	// before touching s.events, so we never panic with "send on closed
+	// channel" from a goroutine that outlives Close (e.g. the waiter in
+	// startProcessLocked, which can race with Close during shutdown).
+	done     chan struct{}
+	doneOnce sync.Once
+
+	// handshakeTimeout stores the timeout configured for this session so
+	// that restart() — which is always a resume scenario — can honour the
+	// user's value instead of silently falling back to the 30s resume default.
+	handshakeTimeout time.Duration
+
+	// Throttle for tool_execution_update events (long-running tool partial output).
+	// We collapse bursts of partial results to ~5/s to avoid flooding the event
+	// channel and starving out the actual result.
+	toolUpdateMu sync.Mutex
+	// lastToolUpdateAt is touched only under toolUpdateMu, so we never need
+	// an atomic copy on the read side.
+	lastToolUpdateAt time.Time
+
+	// cleanMu + cleanScheduled implement a simple debounce: at most one
+	// cleanAttachments goroutine is scheduled per debounceWindow, no matter
+	// how many Send() calls happen in between. This prevents goroutine
+	// explosions on chatty sessions that attach files frequently.
+	cleanMu       sync.Mutex
+	cleanScheduled bool
 }
+
+// debounceWindow is the minimum gap between two background attachment-cleanup
+// runs. A single goroutine is plenty because stale files are not time-critical.
+const debounceWindow = 5 * time.Minute
 
 type extUIRequest struct {
 	ID      string
@@ -75,7 +104,20 @@ type extUIRequest struct {
 	Options []string
 }
 
-func newPiSession(ctx context.Context, cmd, workDir, model, thinking, resumeID string, extraEnv []string) (*piSession, error) {
+// handshakeTimeoutDefaultNew is the default timeout for the initial get_state
+// handshake when starting a fresh pi session (no resume).
+const handshakeTimeoutDefaultNew = 15 * time.Second
+
+// handshakeTimeoutDefaultResume is the default timeout for get_state when
+// resuming an existing pi session (--session or --continue). Resume sessions
+// need more time because pi loads the JSONL history on startup.
+const handshakeTimeoutDefaultResume = 30 * time.Second
+
+// handshakeTimeoutMin is the absolute minimum allowed timeout. Values lower
+// than this are clamped up to prevent flaky failures.
+const handshakeTimeoutMin = 5 * time.Second
+
+func newPiSession(ctx context.Context, cmd, workDir, model, thinking, resumeID string, extraEnv []string, handshakeTimeout time.Duration) (*piSession, error) {
 	sessionCtx, cancel := context.WithCancel(ctx)
 	s := &piSession{
 		cmd:       cmd,
@@ -83,14 +125,18 @@ func newPiSession(ctx context.Context, cmd, workDir, model, thinking, resumeID s
 		model:     model,
 		thinking:  thinking,
 		extraEnv:  extraEnv,
-		events:    make(chan core.Event, 128),
-		ctx:       sessionCtx,
-		cancel:    cancel,
-		extUIReqs: make(map[string]extUIRequest),
+		// Larger buffer reduces the chance that emit() blocks the readLoop
+		// when the engine is briefly slow (e.g. platform API rate limits).
+		events:           make(chan core.Event, 1024),
+		ctx:              sessionCtx,
+		cancel:           cancel,
+		extUIReqs:        make(map[string]extUIRequest),
+		done:             make(chan struct{}),
+		handshakeTimeout: handshakeTimeout,
 	}
 
 	// Start process eagerly so StartSession fails fast if the binary is broken.
-	if err := s.ensureRunning(sessionCtx, resumeID); err != nil {
+	if err := s.ensureRunning(sessionCtx, resumeID, handshakeTimeout); err != nil {
 		_ = s.Close()
 		return nil, err
 	}
@@ -99,7 +145,7 @@ func newPiSession(ctx context.Context, cmd, workDir, model, thinking, resumeID s
 	return s, nil
 }
 
-func (s *piSession) ensureRunning(ctx context.Context, resumeID string) error {
+func (s *piSession) ensureRunning(ctx context.Context, resumeID string, handshakeTimeout time.Duration) error {
 	s.procMu.Lock()
 	defer s.procMu.Unlock()
 	if s.proc != nil && s.stdin != nil && s.tr != nil {
@@ -108,10 +154,10 @@ func (s *piSession) ensureRunning(ctx context.Context, resumeID string) error {
 			return nil
 		}
 	}
-	return s.startProcessLocked(ctx, resumeID)
+	return s.startProcessLocked(ctx, resumeID, handshakeTimeout)
 }
 
-func (s *piSession) startProcessLocked(ctx context.Context, resumeID string) error {
+func (s *piSession) startProcessLocked(ctx context.Context, resumeID string, handshakeTimeout time.Duration) error {
 	// Stop any old process.
 	s.stopProcessLocked()
 
@@ -221,7 +267,20 @@ func (s *piSession) startProcessLocked(ctx context.Context, resumeID string) err
 	}()
 
 	// Handshake: verify RPC works and learn session ID.
-	handshakeCtx, cancel := context.WithTimeout(procCtx, 5*time.Second)
+	// Use the configured timeout or sensible defaults: resume sessions need
+	// more time for pi to load JSONL history.
+	timeout := handshakeTimeout
+	if timeout <= 0 {
+		if strings.TrimSpace(resumeID) != "" {
+			timeout = handshakeTimeoutDefaultResume
+		} else {
+			timeout = handshakeTimeoutDefaultNew
+		}
+	}
+	if timeout < handshakeTimeoutMin {
+		timeout = handshakeTimeoutMin
+	}
+	handshakeCtx, cancel := context.WithTimeout(procCtx, timeout)
 	defer cancel()
 	if err := s.refreshState(handshakeCtx, s.tr); err != nil {
 		s.stopProcessLocked()
@@ -278,7 +337,11 @@ func (s *piSession) restart(ctx context.Context) error {
 	if resume == "" {
 		resume = core.ContinueSession
 	}
-	return s.startProcessLocked(ctx, resume)
+	// restart is always a resume scenario: honour the user-configured
+	// handshake timeout (falling back to the 30s resume default inside
+	// startProcessLocked). Using 0 here would silently widen a user-set
+	// 5s timeout back to 30s on every retry.
+	return s.startProcessLocked(ctx, resume, s.handshakeTimeout)
 }
 
 func (s *piSession) rpcCall(ctx context.Context, cmd map[string]any) (*rpcResponse, error) {
@@ -311,8 +374,14 @@ func (s *piSession) Send(prompt string, images []core.ImageAttachment, files []c
 
 	// Attachments:
 	// - RPC mode forbids @file args, so we pass images inline (base64) and save other files to disk.
-	cleanAttachments(s.workDir)
-
+	// - cleanAttachments now only purges stale files (>1h old) and runs in a
+	//   goroutine so it never blocks the user-facing Send path. We use a
+	//   debounce window to avoid spawning a fresh goroutine on every Send
+	//   (chatty sessions would otherwise leak hundreds of short-lived goroutines
+	//   doing redundant os.ReadDir+stat work).
+	if len(files) > 0 {
+		s.scheduleCleanup()
+	}
 	filePaths := core.SaveFilesToDisk(s.workDir, files)
 	prompt = core.AppendFileRefs(prompt, filePaths)
 
@@ -332,7 +401,7 @@ func (s *piSession) Send(prompt string, images []core.ImageAttachment, files []c
 		})
 	}
 
-	if err := s.ensureRunning(s.ctx, s.CurrentSessionID()); err != nil {
+	if err := s.ensureRunning(s.ctx, s.CurrentSessionID(), 0); err != nil {
 		return err
 	}
 
@@ -345,20 +414,21 @@ func (s *piSession) Send(prompt string, images []core.ImageAttachment, files []c
 		cmd["streamingBehavior"] = "steer"
 	}
 
-	ctx, cancel := context.WithTimeout(s.ctx, 60*time.Second)
-	defer cancel()
-
-	resp, err := s.rpcCall(ctx, cmd)
-	if err != nil {
-		// Attempt one restart + retry.
-		if restartErr := s.restart(s.ctx); restartErr == nil {
-			resp, err = s.rpcCall(ctx, cmd)
+	// ★ OPTIMIZATION: fire-and-forget the prompt.
+	// Previously we waited up to 60s for pi to acknowledge the prompt, but
+	// the "prompt" response only confirms receipt — not completion. The actual
+	// outcome is delivered via events (agent_start → text_delta* → agent_end).
+	// Removing this wait slashes TTFT (time to first token) dramatically,
+	// because Send now returns as soon as the bytes are written to stdin.
+	//
+	// Transient pipe errors are retried in-place; only a dead pipe triggers
+	// a full process restart.
+	if err := s.rpcNotify(cmd); err != nil {
+		if s.isRetryableSendErr(err) {
+			if restartErr := s.restart(s.ctx); restartErr == nil {
+				return s.rpcNotify(cmd)
+			}
 		}
-	}
-	if err != nil {
-		return err
-	}
-	if err := resp.asError(); err != nil {
 		return err
 	}
 	return nil
@@ -454,9 +524,13 @@ func (s *piSession) CurrentSessionID() string {
 func (s *piSession) Alive() bool { return s.alive.Load() }
 
 func (s *piSession) Close() error {
-	if !s.alive.CompareAndSwap(true, false) {
-		// still stop process and close events only once
-	}
+	// Close is idempotent; mark the session as not-alive so any late emit
+	// (from the waiter goroutine racing with shutdown) can short-circuit.
+	s.alive.Store(false)
+	// Signal done first. After this, emit() will not touch s.events again,
+	// so the eventual close(s.events) cannot panic a concurrent send.
+	s.doneOnce.Do(func() { close(s.done) })
+
 	s.cancel()
 
 	s.procMu.Lock()
@@ -474,11 +548,9 @@ func (s *piSession) Close() error {
 		slog.Warn("pi: close timed out")
 	}
 
-	select {
-	case <-s.events:
-		// drain if someone wrote after cancel; best-effort
-	default:
-	}
+	// By this point all wg-tracked goroutines have either finished or been
+	// forcibly abandoned. No new emit() can reach s.events, so it is safe
+	// to close it.
 	close(s.events)
 	return nil
 }
@@ -499,9 +571,7 @@ func (s *piSession) handleRPCEvent(env map[string]any) {
 	switch typ {
 	case "agent_start":
 		s.streaming.Store(true)
-		s.turnMu.Lock()
-		s.textSeen = false
-		s.turnMu.Unlock()
+		s.textSeen.Store(false)
 
 	case "agent_end":
 		s.streaming.Store(false)
@@ -522,10 +592,7 @@ func (s *piSession) handleRPCEvent(env map[string]any) {
 
 		// Emit EventResult to end this turn.
 		content := ""
-		s.turnMu.Lock()
-		seen := s.textSeen
-		s.turnMu.Unlock()
-		if !seen {
+		if !s.textSeen.Load() {
 			content, _ = extractAssistantTextFromAgentEnd(env)
 		}
 		inTok, outTok := extractTokensFromAgentEnd(env)
@@ -560,12 +627,30 @@ func (s *piSession) handleRPCEvent(env map[string]any) {
 		// Pi streams partial output for long-running tools (notably bash).
 		// Forward a trimmed version as EventThinking so the user sees real-time
 		// progress — without this, a 30s `go test` looks identical to a hung agent.
+		//
+		// ★ OPTIMIZATION: throttle to ~5 events/sec. A 30s `go test` would
+		// otherwise emit hundreds of partial results, flooding the events
+		// channel and starving out higher-priority events (text deltas, results).
 		partial, _ := env["partialResult"].(map[string]any)
-		if partial != nil {
-			if txt := strings.TrimSpace(extractToolResultText(partial)); txt != "" {
-				s.emit(core.Event{Type: core.EventThinking, Content: truncStr(txt, 400)})
-			}
+		if partial == nil {
+			return
 		}
+		txt := strings.TrimSpace(extractToolResultText(partial))
+		if txt == "" {
+			return
+		}
+		const toolUpdateInterval = 200 * time.Millisecond
+		// Single critical section: read+check+update atomically. The previous
+		// double-lock version had a TOCTOU window where two goroutines could
+		// both see the interval as elapsed and both emit, defeating the throttle.
+		s.toolUpdateMu.Lock()
+		if !s.lastToolUpdateAt.IsZero() && time.Since(s.lastToolUpdateAt) < toolUpdateInterval {
+			s.toolUpdateMu.Unlock()
+			return
+		}
+		s.lastToolUpdateAt = time.Now()
+		s.toolUpdateMu.Unlock()
+		s.emit(core.Event{Type: core.EventThinking, Content: truncStr(txt, 400)})
 
 	case "extension_error":
 		errMsg, _ := env["error"].(string)
@@ -616,9 +701,7 @@ func (s *piSession) handleMessageUpdate(env map[string]any) {
 	case "text_delta":
 		delta, _ := ame["delta"].(string)
 		if delta != "" {
-			s.turnMu.Lock()
-			s.textSeen = true
-			s.turnMu.Unlock()
+			s.textSeen.Store(true)
 			s.emit(core.Event{Type: core.EventText, Content: delta})
 		}
 	case "thinking_start":
@@ -849,27 +932,54 @@ func buildRetryThinkingMessage(env map[string]any) string {
 func stripAnsi(s string) string {
 	var sb strings.Builder
 	runes := []rune(s)
-	for i := 0; i < len(runes); i++ {
+	for i := 0; i < len(runes); {
 		if runes[i] != 0x1b {
 			sb.WriteRune(runes[i])
-			continue
-		}
-		// Skip `ESC [ params final-letter`.
-		i++
-		if i >= len(runes) || runes[i] != '[' {
-			// Not a valid CSI sequence; emit the ESC and continue.
-			i-- // Reset to the ESC position (will be incremented after continue)
-			continue
-		}
-		i++
-		for i < len(runes) {
-			r := runes[i]
 			i++
-			if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') {
+			continue
+		}
+		// Potential CSI sequence: ESC [ params final-letter
+		// Check if we have enough characters for ESC [
+		if i+1 >= len(runes) || runes[i+1] != '[' {
+			// Not a valid CSI sequence; emit the ESC as-is
+			sb.WriteRune(runes[i])
+			i++
+			continue
+		}
+		// Look ahead to find a valid CSI final character within a reasonable limit.
+		// We recognize common CSI final characters:
+		// - A-Z: most cursor, erase, scroll commands
+		// - h: SM (Set Mode, including private modes like ?25 for cursor visibility)
+		// - l: RM (Reset Mode)
+		// - m: SGR (Select Graphic Rendition, colors/styles)
+		// - r: DECSTBM (Set Top and Bottom Margins)
+		const maxLookahead = 32
+		finalPos := -1
+		for j := i + 2; j < len(runes) && j < i+2+maxLookahead; j++ {
+			r := runes[j]
+			// Check if this rune is a valid CSI final character
+			isCSIChar := (r >= 'A' && r <= 'Z') || r == 'h' || r == 'l' || r == 'm' || r == 'r'
+			if isCSIChar {
+				finalPos = j
+				break
+			}
+			// If we encounter a non-CSI byte (outside param/intermediate range),
+			// this isn't a valid CSI sequence.
+			isParamByte := (r >= 0x30 && r <= 0x3F) // 0-9, :, ;, <, =, >, ?
+			isIntermediateByte := (r >= 0x20 && r <= 0x2F) // space to /
+			if !isParamByte && !isIntermediateByte {
 				break
 			}
 		}
-		i-- // Backtrack one step (the final character was already consumed)
+		if finalPos == -1 {
+			// No valid CSI final character found within lookahead limit;
+			// emit ESC and continue (the '[' will be handled in next iteration if valid)
+			sb.WriteRune(runes[i])
+			i++
+			continue
+		}
+		// Valid CSI sequence: skip from ESC to final character (inclusive)
+		i = finalPos + 1
 	}
 	return sb.String()
 }
@@ -911,24 +1021,106 @@ func intFromAny(v any) int {
 	}
 }
 
+// emit sends an event to the engine's consumer.
+//
+// High-priority events (Result, Error, PermissionRequest) ALWAYS block
+// until delivered — dropping them would lose the user's turn or stall the
+// engine indefinitely.
+//
+// Low-priority events (Text, ToolUse, ToolResult, Thinking) use a
+// non-blocking send. If the consumer (engine) is briefly slow — e.g. a
+// platform API rate limit, a slow UpdateMessage — the events channel
+// could fill up. Blocking in that case would back up the readLoop and
+// stall the entire pipeline (including the matching of pending RPC
+// responses). Dropping a "thinking" line is harmless; the user just
+// sees one fewer progress blip.
+//
+// All paths check s.done first: once Close() is in progress, emit becomes
+// a no-op so we never race with close(s.events) and panic.
 func (s *piSession) emit(evt core.Event) {
 	if evt.Type == "" {
 		return
 	}
 	select {
-	case s.events <- evt:
-	case <-s.ctx.Done():
+	case <-s.done:
+		return
+	default:
+	}
+	switch evt.Type {
+	case core.EventResult, core.EventError, core.EventPermissionRequest:
+		select {
+		case s.events <- evt:
+		case <-s.done:
+		case <-s.ctx.Done():
+		}
+	default:
+		select {
+		case s.events <- evt:
+		case <-s.done:
+		default:
+			slog.Debug("pi: drop low-priority event", "type", evt.Type)
+		}
 	}
 }
 
+// scheduleCleanup debounces background attachment cleanup so a chatty
+// session does not spawn one goroutine per Send. At most one cleanup
+// runs per debounceWindow. The actual work is done by cleanAttachments,
+// which is also safe to call directly (e.g. from Close) without the
+// debounce.
+func (s *piSession) scheduleCleanup() {
+	s.cleanMu.Lock()
+	if s.cleanScheduled {
+		s.cleanMu.Unlock()
+		return
+	}
+	s.cleanScheduled = true
+	s.cleanMu.Unlock()
+
+	go func() {
+		// Wait for the debounce window to settle so a burst of Sends
+		// coalesces into a single cleanup pass.
+		timer := time.NewTimer(debounceWindow)
+		defer timer.Stop()
+		select {
+		case <-timer.C:
+		case <-s.done:
+			// Shutdown: drop the scheduled cleanup. New sessions get a
+			// fresh s.cleanScheduled=false because this is a per-session
+			// field; an old session being torn down never matters.
+			s.cleanMu.Lock()
+			s.cleanScheduled = false
+			s.cleanMu.Unlock()
+			return
+		}
+		cleanAttachments(s.workDir)
+		s.cleanMu.Lock()
+		s.cleanScheduled = false
+		s.cleanMu.Unlock()
+	}()
+}
+
+// cleanAttachments removes attachment files older than the retention window.
+// Called from a goroutine on the Send path to keep I/O off the hot path.
 func cleanAttachments(workDir string) {
 	attachDir := filepath.Join(workDir, ".cc-connect", "attachments")
 	entries, err := os.ReadDir(attachDir)
 	if err != nil {
 		return
 	}
+	threshold := time.Now().Add(-1 * time.Hour)
 	for _, e := range entries {
-		if !e.IsDir() {
+		if e.IsDir() {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		// Keep recent files (the model may still be reading them). Only purge
+		// files that are clearly stale, so a busy session doesn't pay for
+		// repeated unlink() syscalls.
+		if info.ModTime().Before(threshold) {
 			_ = os.Remove(filepath.Join(attachDir, e.Name()))
 		}
 	}

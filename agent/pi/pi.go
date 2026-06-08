@@ -50,8 +50,12 @@ type Agent struct {
 	// with pi's --continue semantics (resume latest session in workDir).
 	// WARNING: this may merge contexts across different cc-connect sessions that share the same workDir.
 	continueOnEmpty bool
-	sessionEnv      []string
-	mu              sync.Mutex
+	// Timeout for the initial get_state handshake when starting/reconnecting to
+	// a pi RPC process. Larger sessions may need more time for pi to load its
+	// JSONL history. Zero means use defaults (15s for new, 30s for resume).
+	handshakeTimeout time.Duration
+	sessionEnv       []string
+	mu               sync.Mutex
 }
 
 func New(opts map[string]any) (core.Agent, error) {
@@ -88,12 +92,18 @@ func New(opts map[string]any) (core.Agent, error) {
 		return nil, fmt.Errorf("pi: %q not found in PATH, install with: npm install -g @earendil-works/pi-coding-agent", cmd)
 	}
 
+	handshakeTimeout := parseDurationOption(opts, "handshake_timeout", 0)
+	if handshakeTimeout < 0 {
+		handshakeTimeout = 0
+	}
+
 	return &Agent{
-		cmd:             cmd,
-		workDir:         workDir,
-		model:           model,
-		mode:            mode,
-		continueOnEmpty: continueOnEmpty,
+		cmd:              cmd,
+		workDir:          workDir,
+		model:            model,
+		mode:             mode,
+		continueOnEmpty:  continueOnEmpty,
+		handshakeTimeout: handshakeTimeout,
 	}, nil
 }
 
@@ -225,6 +235,7 @@ func (a *Agent) StartSession(ctx context.Context, sessionID string) (core.AgentS
 	extraEnv := append([]string{}, a.sessionEnv...)
 	cmd := a.cmd
 	continueOnEmpty := a.continueOnEmpty
+	handshakeTimeout := a.handshakeTimeout
 	a.mu.Unlock()
 	if strings.TrimSpace(sessionID) == "" && continueOnEmpty {
 		sessionID = core.ContinueSession
@@ -232,7 +243,7 @@ func (a *Agent) StartSession(ctx context.Context, sessionID string) (core.AgentS
 	if mode == "json" {
 		return newPiJSONSession(ctx, cmd, workDir, model, thinking, sessionID, extraEnv)
 	}
-	return newPiSession(ctx, cmd, workDir, model, thinking, sessionID, extraEnv)
+	return newPiSession(ctx, cmd, workDir, model, thinking, sessionID, extraEnv, handshakeTimeout)
 }
 
 func (a *Agent) ListSessions(_ context.Context) ([]core.AgentSessionInfo, error) {
@@ -362,6 +373,37 @@ func (a *Agent) SetMode(mode string) {
 	a.mu.Lock()
 	a.mode = m
 	a.mu.Unlock()
+}
+
+// parseDurationOption extracts a duration from opts as either a Go duration
+// string (e.g. "30s", "1m") or a number of seconds. Returns defaultValue when
+// the key is absent/unparsable; parse failures are logged at debug level so
+// misconfigurations (e.g. "30 seconds" with a space, which is NOT a valid
+// Go duration string) don't fail silently.
+func parseDurationOption(opts map[string]any, key string, defaultValue time.Duration) time.Duration {
+	v, ok := opts[key]
+	if !ok {
+		return defaultValue
+	}
+	switch x := v.(type) {
+	case string:
+		if d, err := time.ParseDuration(strings.TrimSpace(x)); err == nil {
+			return d
+		} else {
+			slog.Debug("pi: ignoring unparsable duration option", "key", key, "value", x, "default", defaultValue, "error", err)
+		}
+	case float64:
+		return time.Duration(x) * time.Second
+	case int:
+		return time.Duration(x) * time.Second
+	case int64:
+		return time.Duration(x) * time.Second
+	case time.Duration:
+		return x
+	default:
+		slog.Debug("pi: ignoring duration option with unsupported type", "key", key, "type", fmt.Sprintf("%T", v), "default", defaultValue)
+	}
+	return defaultValue
 }
 
 func (a *Agent) GetWorkDir() string {

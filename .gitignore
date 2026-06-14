@@ -3,6 +3,7 @@
 # ============================================================================
 /cc-connect
 /cmd/cc-connect/cc-connect
+cc-connect.bak-*
 *.exe
 *.exe~
 *.dll
@@ -10,6 +11,7 @@
 *.dylib
 *.test
 *.out
+*.old
 
 # ============================================================================
 # Go workspace & tooling
@@ -39,8 +41,13 @@ vendor/
 config.toml
 .config.toml.lock
 config\ copy.toml
+config.*.toml
+!config.example.toml
 .env
 *.local.toml
+
+# Instance lock files (created at startup, released on shutdown)
+*.toml.lock
 
 # CC-Connect runtime state
 .cc-connect/
@@ -61,6 +68,8 @@ release/
 # Keep web/dist directory (for embedded admin UI) but ignore build artifacts
 web/dist/*
 !web/dist/.keep
+# TypeScript incremental build cache — generated locally, should not be committed
+web/tsconfig.tsbuildinfo
 
 # ============================================================================
 # Testing & temporary files
@@ -121,6 +130,11 @@ ehthumbs.db
 Desktop.ini
 
 # ============================================================================
+# AI agent planning artifacts
+# ============================================================================
+.planning/
+
+# ============================================================================
 # Security
 # ============================================================================
 # Never commit secrets or credentials
@@ -130,3 +144,6 @@ Desktop.ini
 *.pfx
 secrets/
 credentials/
+
+.codex
+cc-connect-new

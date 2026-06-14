@@ -1,13 +1,12 @@
 package pi
 
 import (
-	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
-	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
-	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -15,795 +14,1846 @@ import (
 	"github.com/chenhg5/cc-connect/core"
 )
 
-func TestSummarizeToolArgs(t *testing.T) {
-	if got := summarizeToolArgs(nil); got != "" {
-		t.Fatalf("summarizeToolArgs(nil) = %q", got)
-	}
-	if got := summarizeToolArgs(map[string]any{"command": "ls -la"}); got != "ls -la" {
-		t.Fatalf("summarizeToolArgs(command) = %q", got)
-	}
-	if got := summarizeToolArgs(map[string]any{"file_path": "/tmp/a.txt"}); got != "/tmp/a.txt" {
-		t.Fatalf("summarizeToolArgs(file_path) = %q", got)
-	}
-}
+// ── normalizeMode ────────────────────────────────────────────
 
-func TestExtractAgentEndError(t *testing.T) {
-	cases := []struct {
-		name string
-		env  map[string]any
+func TestNormalizeMode(t *testing.T) {
+	tests := []struct {
+		in   string
 		want string
 	}{
-		{
-			name: "clean",
-			env:  map[string]any{"messages": []any{}},
-			want: "",
-		},
-		{
-			name: "top-level errorMessage",
-			env:  map[string]any{"errorMessage": "oops", "messages": []any{}},
-			want: "oops",
-		},
-		{
-			name: "top-level error",
-			env:  map[string]any{"error": "fallback", "messages": []any{}},
-			want: "fallback",
-		},
-		{
-			name: "message stopReason=error",
-			env: map[string]any{"messages": []any{
-				map[string]any{"role": "assistant", "stopReason": "error", "errorMessage": "rate limited"},
-			}},
-			want: "rate limited",
-		},
-		{
-			name: "assistant content type=error text",
-			env: map[string]any{"messages": []any{
-				map[string]any{"role": "assistant", "content": []any{
-					map[string]any{"type": "error", "text": "provider 500"},
-				}},
-			}},
-			want: "provider 500",
-		},
-		{
-			name: "assistant content type=error message",
-			env: map[string]any{"messages": []any{
-				map[string]any{"role": "assistant", "content": []any{
-					map[string]any{"type": "error", "message": "via message key"},
-				}},
-			}},
-			want: "via message key",
-		},
-		{
-			name: "stopReason=error but no message",
-			env:  map[string]any{"stopReason": "error", "messages": []any{}},
-			want: "agent returned unknown error",
-		},
+		{"", "default"},
+		{"default", "default"},
+		{"yolo", "yolo"},
+		{"YOLO", "yolo"},
+		{"bypass", "yolo"},
+		{"auto-approve", "yolo"},
+		{"  Yolo  ", "yolo"},
+		{"  Bypass ", "yolo"},
+		{"unknown", "default"},
+		{"something", "default"},
 	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			got := extractAgentEndError(tc.env)
-			if got != tc.want {
-				t.Fatalf("extractAgentEndError() = %q, want %q", got, tc.want)
-			}
-		})
-	}
-}
-
-func TestStripAnsi(t *testing.T) {
-	in := "\x1b[32mhello\x1b[0m world\x1b[1;31m!\x1b[0m"
-	want := "hello world!"
-	if got := stripAnsi(in); got != want {
-		t.Fatalf("stripAnsi() = %q, want %q", got, want)
-	}
-}
-
-func TestBuildRetryThinkingMessage(t *testing.T) {
-	if got := buildRetryThinkingMessage(map[string]any{"errorMessage": "short", "messages": []any{}}); !strings.Contains(got, "short") {
-		t.Fatalf("expected retry message to contain error, got %q", got)
-	}
-	if got := buildRetryThinkingMessage(map[string]any{"messages": []any{}}); !strings.Contains(got, "retry") {
-		t.Fatalf("expected default retry text, got %q", got)
-	}
-}
-
-func TestCleanAttachments(t *testing.T) {
-	tmp := t.TempDir()
-	attachDir := filepath.Join(tmp, ".cc-connect", "attachments")
-	if err := os.MkdirAll(attachDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	// Create one fresh file and one stale file. cleanAttachments should
-	// remove only the stale one (lazy cleanup avoids paying unlink() on
-	// every Send).
-	fresh := filepath.Join(attachDir, "fresh.txt")
-	stale := filepath.Join(attachDir, "stale.txt")
-	if err := os.WriteFile(fresh, []byte("x"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(stale, []byte("y"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	old := time.Now().Add(-2 * time.Hour)
-	if err := os.Chtimes(stale, old, old); err != nil {
-		t.Fatal(err)
-	}
-	cleanAttachments(tmp)
-	entries, _ := os.ReadDir(attachDir)
-	if len(entries) != 1 {
-		t.Fatalf("expected 1 file remaining (fresh kept, stale removed), got %d files", len(entries))
-	}
-	if entries[0].Name() != "fresh.txt" {
-		t.Fatalf("expected fresh.txt to remain, got %s", entries[0].Name())
-	}
-}
-
-// TestEmitAfterCloseDoesNotPanic guards against the historical race where
-// goroutines that outlived Close() (notably the process waiter in
-// startProcessLocked) would call emit() and panic with "send on closed
-// channel". This is a direct regression test for the done-channel
-// synchronization added in Close/emit.
-func TestEmitAfterCloseDoesNotPanic(t *testing.T) {
-	s := &piSession{
-		events: make(chan core.Event, 16),
-		ctx:    context.Background(),
-		cancel: func() {},
-		done:   make(chan struct{}),
-	}
-	// Simulate Close() running and closing done + events.
-	s.alive.Store(false)
-	close(s.done)
-	close(s.events)
-
-	// This must not panic, even though s.events is already closed.
-	defer func() {
-		if r := recover(); r != nil {
-			t.Fatalf("emit panicked after Close: %v", r)
+	for _, tt := range tests {
+		if got := normalizeMode(tt.in); got != tt.want {
+			t.Errorf("normalizeMode(%q) = %q, want %q", tt.in, got, tt.want)
 		}
-	}()
-	s.emit(core.Event{Type: core.EventText, Content: "late"})
-	s.emit(core.Event{Type: core.EventResult, Done: true})
-	s.emit(core.Event{Type: core.EventError, Error: fmt.Errorf("late")})
-	s.emit(core.Event{Type: core.EventPermissionRequest, RequestID: "x"})
-}
-
-// TestEmitEmptyTypeNoOp checks the trivial short-circuit at the top of emit.
-func TestEmitEmptyTypeNoOp(t *testing.T) {
-	s := &piSession{
-		events: make(chan core.Event, 1),
-		ctx:    context.Background(),
-		cancel: func() {},
-		done:   make(chan struct{}),
-	}
-	s.emit(core.Event{}) // no Type
-	select {
-	case <-s.events:
-		t.Fatal("emit with empty type should not enqueue")
-	default:
 	}
 }
 
-// TestScheduleCleanupDebounce verifies that rapid-fire scheduleCleanup()
-// calls coalesce into a single background goroutine via the debounce flag.
-func TestScheduleCleanupDebounce(t *testing.T) {
-	tmp := t.TempDir()
-	attachDir := filepath.Join(tmp, ".cc-connect", "attachments")
-	if err := os.MkdirAll(attachDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
+// ── Agent constructor ────────────────────────────────────────
 
-	s := &piSession{
-		workDir: tmp,
-		done:    make(chan struct{}),
-		cancel:  func() {},
-	}
-	// Create the file we'd expect to survive (recent) vs. the stale one
-	// that would be removed (old).
-	fresh := filepath.Join(attachDir, "fresh.txt")
-	stale := filepath.Join(attachDir, "stale.txt")
-	if err := os.WriteFile(fresh, []byte("x"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(stale, []byte("y"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	old := time.Now().Add(-2 * time.Hour)
-	if err := os.Chtimes(stale, old, old); err != nil {
-		t.Fatal(err)
-	}
-
-	// Fire scheduleCleanup many times in a row. With the debounce fix, at
-	// most one cleanup goroutine should be scheduled. The first call wins;
-	// the rest are no-ops.
-	for i := 0; i < 50; i++ {
-		s.scheduleCleanup()
-	}
-
-	// Wait briefly so the scheduled goroutine has a chance to finish.
-	// (debonceWindow defaults to 5 minutes in production; we just need to
-	// verify scheduling is bounded — we shut s.done down to release the
-	// timer goroutine immediately.)
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		s.cleanMu.Lock()
-		done := !s.cleanScheduled
-		s.cleanMu.Unlock()
-		if done {
-			break
+func TestNew_DefaultValues(t *testing.T) {
+	// Isolate from real settings.json so we test pure defaults.
+	savedEnv := os.Getenv("PI_CODING_AGENT_DIR")
+	t.Cleanup(func() {
+		if savedEnv != "" {
+			_ = os.Setenv("PI_CODING_AGENT_DIR", savedEnv)
+		} else {
+			_ = os.Unsetenv("PI_CODING_AGENT_DIR")
 		}
-		time.Sleep(10 * time.Millisecond)
+	})
+	t.Setenv("PI_CODING_AGENT_DIR", t.TempDir())
+
+	// Use a command that exists on all systems.
+	ag, err := New(map[string]any{"cmd": "echo"})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
 	}
-
-	// Closing done releases the in-flight timer so the test exits cleanly.
-	close(s.done)
-
-	// The scheduled goroutine never actually completes in 2s (it waits
-	// for debounceWindow = 5min), but that's fine — the point of the
-	// test is that scheduleCleanup itself is idempotent under burst load,
-	// which is verified by cleanScheduled transitioning back to false
-	// after one full pass. In this short window we expect only ONE
-	// goroutine to have been spawned, which is what cleanScheduled
-	// tracking proves. The actual file deletion is exercised by
-	// TestCleanAttachments above.
+	a := ag.(*Agent)
+	if a.workDir != "." {
+		t.Errorf("workDir = %q, want \".\"", a.workDir)
+	}
+	if a.model != "" {
+		t.Errorf("model = %q, want empty", a.model)
+	}
+	if a.mode != "default" {
+		t.Errorf("mode = %q, want \"default\"", a.mode)
+	}
+	if a.cmd != "echo" {
+		t.Errorf("cmd = %q, want \"echo\"", a.cmd)
+	}
 }
 
-func newTestAgent(t *testing.T, workDir string, extraEnv map[string]string) *Agent {
-	// We cannot exec the test binary directly with custom flags like "--mode" because
-	// the Go test runner will reject unknown flags before running TestHelperProcess.
-	// Use a tiny shell wrapper that invokes the test binary with -test.run and passes
-	// all pi args after "--".
-	wrapper := filepath.Join(workDir, "pi-helper.sh")
-	wrapperBody := "#!/bin/sh\n" +
-		"exec \"" + os.Args[0] + "\" -test.run TestHelperProcess -- \"$@\"\n"
-	if err := os.WriteFile(wrapper, []byte(wrapperBody), 0o755); err != nil {
-		t.Fatalf("write wrapper: %v", err)
-	}
-
+func TestNew_CustomOptions(t *testing.T) {
 	ag, err := New(map[string]any{
-		"cmd":      wrapper,
-		"work_dir": workDir,
+		"cmd":      "echo",
+		"work_dir": "/tmp",
+		"model":    "qwen3.5-plus",
+		"mode":     "yolo",
 	})
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
 	a := ag.(*Agent)
-	var envPairs []string
-	envPairs = append(envPairs, "GO_WANT_HELPER_PROCESS=1")
-	for k, v := range extraEnv {
-		envPairs = append(envPairs, k+"="+v)
+	if a.workDir != "/tmp" {
+		t.Errorf("workDir = %q", a.workDir)
 	}
-	a.SetSessionEnv(envPairs)
-	return a
-}
-
-func drainFor(d time.Duration, ch <-chan core.Event) {
-	deadline := time.After(d)
-	for {
-		select {
-		case <-deadline:
-			return
-		case <-ch:
-			// drain
-		default:
-			time.Sleep(1 * time.Millisecond)
-		}
+	if a.model != "qwen3.5-plus" {
+		t.Errorf("model = %q", a.model)
+	}
+	if a.mode != "yolo" {
+		t.Errorf("mode = %q", a.mode)
 	}
 }
 
-func TestPiSession_JSONPromptFlow(t *testing.T) {
-	workDir := t.TempDir()
-	a := newTestAgent(t, workDir, map[string]string{
-		"PI_HELPER_SESSION_ID": "sess-123",
-	})
-	a.SetMode("json")
-
-	sessAny, err := a.StartSession(context.Background(), "")
-	if err != nil {
-		t.Fatalf("StartSession error = %v", err)
+func TestNew_CmdNotFound(t *testing.T) {
+	_, err := New(map[string]any{"cmd": "nonexistent-binary-xyz-12345"})
+	if err == nil {
+		t.Fatal("expected error for missing binary")
 	}
-	defer sessAny.Close()
-
-	if err := sessAny.Send("hello", nil, nil); err != nil {
-		t.Fatalf("Send error = %v", err)
-	}
-
-	evCh := sessAny.Events()
-	var gotText strings.Builder
-	gotToolUse := false
-	gotToolResult := false
-	var gotResult *core.Event
-
-	timer := time.NewTimer(2 * time.Second)
-	defer timer.Stop()
-	for gotResult == nil {
-		select {
-		case <-timer.C:
-			t.Fatal("timeout waiting for EventResult")
-		case ev := <-evCh:
-			switch ev.Type {
-			case core.EventText:
-				gotText.WriteString(ev.Content)
-			case core.EventToolUse:
-				gotToolUse = true
-			case core.EventToolResult:
-				gotToolResult = true
-			case core.EventResult:
-				tmp := ev
-				gotResult = &tmp
-			}
-		}
-	}
-
-	if gotText.String() != "Hello from helper" {
-		t.Fatalf("text = %q, want %q", gotText.String(), "Hello from helper")
-	}
-	if !gotToolUse {
-		t.Fatal("expected tool use event")
-	}
-	if !gotToolResult {
-		t.Fatal("expected tool result event")
-	}
-	if gotResult.SessionID != "sess-123" {
-		t.Fatalf("result SessionID = %q, want sess-123", gotResult.SessionID)
-	}
-	if !gotResult.Done {
-		t.Fatal("expected result Done")
-	}
-	if gotResult.InputTokens != 123 || gotResult.OutputTokens != 45 {
-		t.Fatalf("tokens = (%d,%d), want (123,45)", gotResult.InputTokens, gotResult.OutputTokens)
+	if !strings.Contains(err.Error(), "not found in PATH") {
+		t.Errorf("unexpected error: %v", err)
 	}
 }
 
-func TestPiAgent_AvailableModels_RPC(t *testing.T) {
-	workDir := t.TempDir()
-	modelsJSON := `[
-		{"id":"claude-sonnet-4-20250514","name":"Claude Sonnet 4","provider":"anthropic"},
-		{"id":"gpt-4.1","name":"GPT-4.1","provider":"openai"}
-	]`
-	a := newTestAgent(t, workDir, map[string]string{
-		"PI_HELPER_MODELS_JSON": modelsJSON,
-	})
-
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	got := a.AvailableModels(ctx)
-	want := []core.ModelOption{
-		{Name: "anthropic/claude-sonnet-4-20250514", Desc: "Claude Sonnet 4", Alias: "claude-sonnet-4-20250514"},
-		{Name: "openai/gpt-4.1", Desc: "GPT-4.1", Alias: "gpt-4.1"},
-	}
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("AvailableModels() = %#v, want %#v", got, want)
-	}
-}
-
-func TestPiSession_RPCPromptFlow(t *testing.T) {
-	workDir := t.TempDir()
-	a := newTestAgent(t, workDir, map[string]string{
-		"PI_HELPER_SESSION_ID": "sess-rpc-1",
-	})
-	// RPC is the default; make it explicit for clarity.
-	a.SetMode("rpc")
-
-	sessAny, err := a.StartSession(context.Background(), "")
-	if err != nil {
-		t.Fatalf("StartSession error = %v", err)
-	}
-	defer sessAny.Close()
-
-	if got := sessAny.CurrentSessionID(); got != "sess-rpc-1" {
-		t.Fatalf("initial sessionID = %q, want sess-rpc-1 (from get_state handshake)", got)
-	}
-
-	if err := sessAny.Send("hello", nil, nil); err != nil {
-		t.Fatalf("Send error = %v", err)
-	}
-
-	evCh := sessAny.Events()
-	var gotText strings.Builder
-	gotToolUse := false
-	gotToolResult := false
-	var gotResult *core.Event
-
-	timer := time.NewTimer(3 * time.Second)
-	defer timer.Stop()
-	for gotResult == nil {
-		select {
-		case <-timer.C:
-			t.Fatal("timeout waiting for EventResult")
-		case ev := <-evCh:
-			switch ev.Type {
-			case core.EventText:
-				gotText.WriteString(ev.Content)
-			case core.EventToolUse:
-				gotToolUse = true
-			case core.EventToolResult:
-				gotToolResult = true
-			case core.EventResult:
-				tmp := ev
-				gotResult = &tmp
-			}
-		}
-	}
-
-	if gotText.String() != "Hello from helper" {
-		t.Fatalf("text = %q, want %q", gotText.String(), "Hello from helper")
-	}
-	if !gotToolUse {
-		t.Fatal("expected tool use event")
-	}
-	if !gotToolResult {
-		t.Fatal("expected tool result event")
-	}
-	if gotResult.SessionID != "sess-rpc-1" {
-		t.Fatalf("result SessionID = %q, want sess-rpc-1", gotResult.SessionID)
-	}
-	if !gotResult.Done {
-		t.Fatal("expected result Done")
-	}
-	if gotResult.InputTokens != 123 || gotResult.OutputTokens != 45 {
-		t.Fatalf("tokens = (%d,%d), want (123,45)", gotResult.InputTokens, gotResult.OutputTokens)
-	}
-}
-
-// TestPiSession_RPC_WillRetry verifies that when pi emits agent_end with
-// willRetry=true, we do NOT finalize the cc-connect turn. The next agent_start
-// + agent_end (willRetry=false) pair should drive the single EventResult.
-func TestPiSession_RPC_WillRetry(t *testing.T) {
-	workDir := t.TempDir()
-	a := newTestAgent(t, workDir, map[string]string{
-		"PI_HELPER_SESSION_ID":   "sess-retry",
-		"PI_HELPER_RPC_SCENARIO": "will_retry",
-	})
-
-	sessAny, err := a.StartSession(context.Background(), "")
-	if err != nil {
-		t.Fatalf("StartSession error = %v", err)
-	}
-	defer sessAny.Close()
-
-	if err := sessAny.Send("hello", nil, nil); err != nil {
-		t.Fatalf("Send error = %v", err)
-	}
-
-	evCh := sessAny.Events()
-	var results int
-	var thinkingSeen bool
-	var textSeen bool
-	timer := time.NewTimer(3 * time.Second)
-	defer timer.Stop()
-	for results < 1 {
-		select {
-		case <-timer.C:
-			t.Fatalf("timeout: results=%d thinkingSeen=%v textSeen=%v", results, thinkingSeen, textSeen)
-		case ev := <-evCh:
-			switch ev.Type {
-			case core.EventResult:
-				results++
-				if !ev.Done {
-					t.Fatalf("EventResult.Done = false; want true")
-				}
-			case core.EventThinking:
-				thinkingSeen = true
-			case core.EventText:
-				textSeen = true
-			}
-		}
-	}
-
-	// We should have received exactly ONE EventResult across the two agent_end events.
-	if results != 1 {
-		t.Fatalf("got %d EventResult events, want exactly 1 (willRetry must not double-finalize)", results)
-	}
-	if !textSeen {
-		t.Fatalf("expected text deltas from the retried (successful) attempt")
-	}
-	// Retry thinking message should fire so users don't see a silent stall.
-	if !thinkingSeen {
-		t.Fatalf("expected retry thinking event")
-	}
-}
-
-// TestPiSession_RPC_AgentEndError verifies top-level error extraction.
-func TestPiSession_RPC_AgentEndError(t *testing.T) {
-	workDir := t.TempDir()
-	a := newTestAgent(t, workDir, map[string]string{
-		"PI_HELPER_SESSION_ID":   "sess-err",
-		"PI_HELPER_RPC_SCENARIO": "error",
-	})
-
-	sessAny, err := a.StartSession(context.Background(), "")
-	if err != nil {
-		t.Fatalf("StartSession error = %v", err)
-	}
-	defer sessAny.Close()
-
-	if err := sessAny.Send("hello", nil, nil); err != nil {
-		t.Fatalf("Send error = %v", err)
-	}
-
-	evCh := sessAny.Events()
-	var gotErr string
-	var gotResult bool
-	timer := time.NewTimer(3 * time.Second)
-	defer timer.Stop()
-	for !gotResult {
-		select {
-		case <-timer.C:
-			t.Fatalf("timeout: gotErr=%q gotResult=%v", gotErr, gotResult)
-		case ev := <-evCh:
-			switch ev.Type {
-			case core.EventError:
-				gotErr = ev.Error.Error()
-			case core.EventResult:
-				gotResult = true
-			}
-		}
-	}
-
-	if !strings.Contains(gotErr, "boom") {
-		t.Fatalf("error = %q, want it to contain %q", gotErr, "boom")
-	}
-}
-
-// TestPiSession_RPC_NewEventVocabulary verifies the newer pi 0.78+ event
-// vocabulary (turn/message boundaries, thinking_start, text_start/end, toolcall_*)
-// doesn't break the session and still emits a clean EventResult.
-func TestPiSession_RPC_NewEventVocabulary(t *testing.T) {
-	workDir := t.TempDir()
-	a := newTestAgent(t, workDir, map[string]string{
-		"PI_HELPER_SESSION_ID":   "sess-new",
-		"PI_HELPER_RPC_SCENARIO": "new_events",
-	})
-
-	sessAny, err := a.StartSession(context.Background(), "")
-	if err != nil {
-		t.Fatalf("StartSession error = %v", err)
-	}
-	defer sessAny.Close()
-
-	if err := sessAny.Send("hello", nil, nil); err != nil {
-		t.Fatalf("Send error = %v", err)
-	}
-
-	evCh := sessAny.Events()
-	var gotText strings.Builder
-	var gotThinking bool
-	var gotResult bool
-	timer := time.NewTimer(3 * time.Second)
-	defer timer.Stop()
-	for !gotResult {
-		select {
-		case <-timer.C:
-			t.Fatalf("timeout: text=%q thinking=%v result=%v", gotText.String(), gotThinking, gotResult)
-		case ev := <-evCh:
-			switch ev.Type {
-			case core.EventText:
-				gotText.WriteString(ev.Content)
-			case core.EventThinking:
-				gotThinking = true
-			case core.EventResult:
-				gotResult = true
-			case core.EventError:
-				t.Fatalf("unexpected error: %v", ev.Error)
-			}
-		}
-	}
-
-	if gotText.String() != "Hello from helper" {
-		t.Fatalf("text = %q, want %q", gotText.String(), "Hello from helper")
-	}
-	if !gotThinking {
-		t.Fatalf("expected thinking event from thinking_end")
-	}
-}
-
-func TestPiAgent_SetModel_AppliesToNextSession(t *testing.T) {
-	workDir := t.TempDir()
-	a := newTestAgent(t, workDir, map[string]string{
-		"PI_HELPER_EXPECT_MODEL": "openai/gpt-4.1",
-		"PI_HELPER_SESSION_ID":   "sess-model",
-	})
-	a.SetModel("openai/gpt-4.1")
-	a.SetMode("json")
-
-	sessAny, err := a.StartSession(context.Background(), "")
-	if err != nil {
-		t.Fatalf("StartSession error = %v", err)
-	}
-	defer sessAny.Close()
-
-	// Trigger a prompt so the helper validates --model.
-	if err := sessAny.Send("hello", nil, nil); err != nil {
-		t.Fatalf("Send error = %v", err)
-	}
-}
-
-func TestPiAgent_SetWorkDir_AppliesToNextSession(t *testing.T) {
-	workDir1 := t.TempDir()
-	workDir2 := t.TempDir()
-	a := newTestAgent(t, workDir1, map[string]string{
-		"PI_HELPER_EXPECT_CWD":     workDir2,
-		"PI_HELPER_SESSION_ID":     "sess-wd",
-		"PI_HELPER_NO_PROMPT_EXIT": "1",
-	})
-
-	a.SetWorkDir(workDir2)
-	a.SetMode("json")
-
-	sessAny, err := a.StartSession(context.Background(), "")
-	if err != nil {
-		t.Fatalf("StartSession error = %v", err)
-	}
-	defer sessAny.Close()
-
-	// Trigger a prompt so the helper validates CWD.
-	_ = sessAny.Send("hello", nil, nil)
-}
-
-// --- Helper process (fake `pi --mode rpc`) ---
-
-func TestHelperProcess(t *testing.T) {
-	if os.Getenv("GO_WANT_HELPER_PROCESS") != "1" {
+func TestNew_DefaultCmd(t *testing.T) {
+	// When cmd is not specified, it defaults to "pi".
+	// This will fail if pi is not installed, which is expected in CI.
+	_, err := New(map[string]any{"cmd": ""})
+	if err == nil {
+		// pi is installed — verify the cmd was set
 		return
 	}
-
-	mode := ""
-	modelArg := ""
-	sessionArg := ""
-	hasContinue := false
-	for i := 0; i < len(os.Args); i++ {
-		if os.Args[i] == "--mode" && i+1 < len(os.Args) {
-			mode = os.Args[i+1]
-		}
-		if os.Args[i] == "--model" && i+1 < len(os.Args) {
-			modelArg = os.Args[i+1]
-		}
-		if os.Args[i] == "--session" && i+1 < len(os.Args) {
-			sessionArg = os.Args[i+1]
-		}
-		if os.Args[i] == "--continue" || os.Args[i] == "-c" {
-			hasContinue = true
-		}
+	if !strings.Contains(err.Error(), "'pi' not found") {
+		t.Errorf("unexpected error: %v", err)
 	}
+}
 
-	if exp := os.Getenv("PI_HELPER_EXPECT_MODEL"); exp != "" {
-		if modelArg != exp {
-			fmt.Fprintf(os.Stderr, "helper: --model = %q, want %q\n", modelArg, exp)
-			os.Exit(2)
-		}
+// ── Agent interface methods ──────────────────────────────────
+
+func TestAgent_NameAndDisplay(t *testing.T) {
+	a := &Agent{}
+	if a.Name() != "pi" {
+		t.Errorf("Name() = %q", a.Name())
 	}
-	if exp := os.Getenv("PI_HELPER_EXPECT_CWD"); exp != "" {
-		cwd, _ := os.Getwd()
-		if cwd != exp {
-			fmt.Fprintf(os.Stderr, "helper: cwd = %q, want %q\n", cwd, exp)
-			os.Exit(2)
-		}
+	if a.CLIBinaryName() != "pi" {
+		t.Errorf("CLIBinaryName() = %q", a.CLIBinaryName())
 	}
-
-	sessionID := strings.TrimSpace(sessionArg)
-	if sessionID == "" {
-		sessionID = strings.TrimSpace(os.Getenv("PI_HELPER_SESSION_ID"))
+	if a.CLIDisplayName() != "Pi" {
+		t.Errorf("CLIDisplayName() = %q", a.CLIDisplayName())
 	}
-	if sessionID == "" {
-		sessionID = "sess-default"
+}
+
+func TestAgent_ModelGetSet(t *testing.T) {
+	a := &Agent{}
+	if a.GetModel() != "" {
+		t.Errorf("initial model = %q", a.GetModel())
 	}
-
-	// --- JSON mode: single-shot print-mode output ---
-	if mode == "json" {
-		enc := json.NewEncoder(os.Stdout)
-		cwd, _ := os.Getwd()
-		_ = enc.Encode(map[string]any{"type": "session", "id": sessionID, "timestamp": time.Now().UTC().Format(time.RFC3339Nano), "cwd": cwd})
-		// Simulate a normal turn.
-		_ = enc.Encode(map[string]any{"type": "agent_start"})
-		_ = enc.Encode(map[string]any{"type": "message_update", "assistantMessageEvent": map[string]any{"type": "text_delta", "delta": "Hello from helper"}})
-		_ = enc.Encode(map[string]any{"type": "tool_execution_start", "toolName": "bash", "args": map[string]any{"command": "echo hi"}})
-		_ = enc.Encode(map[string]any{"type": "tool_execution_end", "toolName": "bash", "isError": false, "result": map[string]any{"content": []any{map[string]any{"type": "text", "text": "ok"}}}})
-		_ = enc.Encode(map[string]any{"type": "agent_end", "messages": []any{map[string]any{"role": "assistant", "content": []any{map[string]any{"type": "text", "text": "Hello from helper"}}, "usage": map[string]any{"input": 123, "output": 45}}}})
-		_ = hasContinue // silence unused; only here to prove parsing works.
-		os.Exit(0)
+	a.SetModel("gpt-4o")
+	if a.GetModel() != "gpt-4o" {
+		t.Errorf("after SetModel = %q", a.GetModel())
 	}
+}
 
-	// --- RPC mode: used by AvailableModels() helper ---
-	if mode != "rpc" {
-		fmt.Fprintf(os.Stderr, "helper: expected --mode rpc or --mode json, got %q\n", mode)
-		os.Exit(2)
+func TestAgent_ModeGetSet(t *testing.T) {
+	a := &Agent{mode: "default"}
+	if a.GetMode() != "default" {
+		t.Errorf("initial mode = %q", a.GetMode())
 	}
+	a.SetMode("yolo")
+	if a.GetMode() != "yolo" {
+		t.Errorf("after SetMode(yolo) = %q", a.GetMode())
+	}
+	a.SetMode("bypass")
+	if a.GetMode() != "yolo" {
+		t.Errorf("after SetMode(bypass) = %q", a.GetMode())
+	}
+	a.SetMode("unknown")
+	if a.GetMode() != "default" {
+		t.Errorf("after SetMode(unknown) = %q", a.GetMode())
+	}
+}
 
-	r := bufio.NewReader(os.Stdin)
-	enc := json.NewEncoder(os.Stdout)
-
-	for {
-		lineBytes, err := r.ReadBytes('\n')
-		if err != nil {
-			os.Exit(0)
-		}
-		line := strings.TrimSuffix(string(lineBytes), "\n")
-		line = strings.TrimSuffix(line, "\r")
-		if strings.TrimSpace(line) == "" {
-			continue
-		}
-		var cmd map[string]any
-		if err := json.Unmarshal([]byte(line), &cmd); err != nil {
-			_ = enc.Encode(map[string]any{"type": "response", "command": "parse", "success": false, "error": err.Error()})
-			continue
-		}
-		typ, _ := cmd["type"].(string)
-		id := cmd["id"]
-
-		sendResp := func(command string, success bool, data any, errMsg string) {
-			resp := map[string]any{"type": "response", "command": command, "success": success}
-			if id != nil {
-				resp["id"] = id
-			}
-			if data != nil {
-				resp["data"] = data
-			}
-			if errMsg != "" {
-				resp["error"] = errMsg
-			}
-			_ = enc.Encode(resp)
-		}
-
-		switch typ {
-		case "get_state":
-			sendResp("get_state", true, map[string]any{"sessionId": sessionID, "isStreaming": false}, "")
-		case "get_available_models":
-			raw := os.Getenv("PI_HELPER_MODELS_JSON")
-			var models any
-			if raw != "" {
-				_ = json.Unmarshal([]byte(raw), &models)
-			}
-			if models == nil {
-				models = []any{}
-			}
-			sendResp("get_available_models", true, map[string]any{"models": models}, "")
-		case "prompt":
-			// Acknowledge prompt, then drive a synthetic event stream.
-			sendResp("prompt", true, nil, "")
-
-			scenario := os.Getenv("PI_HELPER_RPC_SCENARIO")
-			switch scenario {
-			case "will_retry":
-				// First agent_end signals retry; second one finalizes.
-				writeEvent(enc, map[string]any{"type": "agent_start"})
-				writeEvent(enc, map[string]any{"type": "message_update", "assistantMessageEvent": map[string]any{"type": "text_delta", "delta": "partial…"}})
-				writeEvent(enc, map[string]any{"type": "agent_end", "willRetry": true, "messages": []any{map[string]any{"role": "assistant", "stopReason": "error", "errorMessage": "transient", "content": []any{}}}})
-				writeEvent(enc, map[string]any{"type": "auto_retry_start", "attempt": 1, "maxAttempts": 3, "errorMessage": "transient"})
-				writeEvent(enc, map[string]any{"type": "agent_start"})
-				writeEvent(enc, map[string]any{"type": "message_update", "assistantMessageEvent": map[string]any{"type": "text_delta", "delta": "Hello from helper"}})
-				writeEvent(enc, map[string]any{"type": "tool_execution_start", "toolName": "bash", "args": map[string]any{"command": "echo hi"}})
-				writeEvent(enc, map[string]any{"type": "tool_execution_end", "toolName": "bash", "isError": false, "result": map[string]any{"content": []any{map[string]any{"type": "text", "text": "ok"}}}})
-				writeEvent(enc, map[string]any{"type": "agent_end", "willRetry": false, "messages": []any{map[string]any{"role": "assistant", "content": []any{map[string]any{"type": "text", "text": "Hello from helper"}}, "usage": map[string]any{"input": 123, "output": 45}}}})
-			case "error":
-				writeEvent(enc, map[string]any{"type": "agent_start"})
-				writeEvent(enc, map[string]any{"type": "agent_end", "willRetry": false, "stopReason": "error", "errorMessage": "boom", "messages": []any{}})
-			case "new_events":
-				// Exercises the newer pi 0.78+ event vocabulary.
-				writeEvent(enc, map[string]any{"type": "agent_start"})
-				writeEvent(enc, map[string]any{"type": "turn_start"})
-				writeEvent(enc, map[string]any{"type": "message_start", "message": map[string]any{"role": "assistant"}})
-				writeEvent(enc, map[string]any{"type": "message_update", "assistantMessageEvent": map[string]any{"type": "thinking_start"}})
-				writeEvent(enc, map[string]any{"type": "message_update", "assistantMessageEvent": map[string]any{"type": "thinking_delta", "delta": "planning…"}})
-				writeEvent(enc, map[string]any{"type": "message_update", "assistantMessageEvent": map[string]any{"type": "thinking_end", "content": "planning…"}})
-				writeEvent(enc, map[string]any{"type": "message_update", "assistantMessageEvent": map[string]any{"type": "text_start"}})
-				writeEvent(enc, map[string]any{"type": "message_update", "assistantMessageEvent": map[string]any{"type": "text_delta", "delta": "Hello from helper"}})
-				writeEvent(enc, map[string]any{"type": "message_update", "assistantMessageEvent": map[string]any{"type": "text_end"}})
-				writeEvent(enc, map[string]any{"type": "message_end", "message": map[string]any{"role": "assistant"}})
-				writeEvent(enc, map[string]any{"type": "turn_end"})
-				writeEvent(enc, map[string]any{"type": "agent_end", "willRetry": false, "messages": []any{map[string]any{"role": "assistant", "content": []any{map[string]any{"type": "text", "text": "Hello from helper"}}, "usage": map[string]any{"input": 7, "output": 8}}}})
-			default:
-				// Default scenario: original happy-path event sequence.
-				writeEvent(enc, map[string]any{"type": "agent_start"})
-				writeEvent(enc, map[string]any{"type": "message_update", "assistantMessageEvent": map[string]any{"type": "text_delta", "delta": "Hello from helper"}})
-				writeEvent(enc, map[string]any{"type": "tool_execution_start", "toolName": "bash", "args": map[string]any{"command": "echo hi"}})
-				writeEvent(enc, map[string]any{"type": "tool_execution_end", "toolName": "bash", "isError": false, "result": map[string]any{"content": []any{map[string]any{"type": "text", "text": "ok"}}}})
-				writeEvent(enc, map[string]any{"type": "agent_end", "willRetry": false, "messages": []any{map[string]any{"role": "assistant", "content": []any{map[string]any{"type": "text", "text": "Hello from helper"}}, "usage": map[string]any{"input": 123, "output": 45}}}})
-			}
-		default:
-			sendResp(typ, false, nil, "unknown command")
+func TestAgent_AvailableModels(t *testing.T) {
+	a := &Agent{}
+	// Without settings.json, should return nil (no error logged — just empty).
+	models := a.AvailableModels(context.Background())
+	if models == nil {
+		// No settings file — acceptable in test environments.
+		return
+	}
+	// If settings.json exists with enabledModels, should return them.
+	for _, m := range models {
+		if m.Name == "" {
+			t.Errorf("model with empty Name: %+v", m)
 		}
 	}
 }
 
-func writeEvent(enc *json.Encoder, ev map[string]any) {
-	_ = enc.Encode(ev)
+func TestReadSettingsModels(t *testing.T) {
+	// Save and restore settings path.
+	savedEnv := os.Getenv("PI_CODING_AGENT_DIR")
+	t.Cleanup(func() {
+		if savedEnv != "" {
+			_ = os.Setenv("PI_CODING_AGENT_DIR", savedEnv)
+		} else {
+			_ = os.Unsetenv("PI_CODING_AGENT_DIR")
+		}
+	})
+
+	tmpDir := t.TempDir()
+	t.Setenv("PI_CODING_AGENT_DIR", tmpDir)
+
+	// No settings.json -> error.
+	_, err := readSettingsModels()
+	if err == nil {
+		t.Error("expected error for missing settings.json")
+	}
+
+	// Write settings.json with enabledModels.
+	settings := map[string]any{
+		"enabledModels": []string{
+			"provider-a/family-a/model-alpha",
+			"provider-a/family-a/model-beta",
+			"provider-b/family-b/model-gamma",
+		},
+		"defaultModel":  "family-a/model-beta",
+		"defaultProvider": "provider-a",
+	}
+	data, _ := json.Marshal(settings)
+	if err := os.WriteFile(filepath.Join(tmpDir, "settings.json"), data, 0o644); err != nil {
+		t.Fatalf("write settings: %v", err)
+	}
+
+	models, err := readSettingsModels()
+	if err != nil {
+		t.Fatalf("readSettingsModels() error = %v", err)
+	}
+	if len(models) != 3 {
+		t.Fatalf("got %d models, want 3", len(models))
+	}
+
+	tests := []struct {
+		name  string
+		alias string
+	}{
+		{"provider-a/family-a/model-alpha", "model-alpha"},
+		{"provider-a/family-a/model-beta", "model-beta"},
+		{"provider-b/family-b/model-gamma", "model-gamma"},
+	}
+	for i, tt := range tests {
+		if models[i].Name != tt.name {
+			t.Errorf("models[%d].Name = %q, want %q", i, models[i].Name, tt.name)
+		}
+		if models[i].Alias != tt.alias {
+			t.Errorf("models[%d].Alias = %q, want %q", i, models[i].Alias, tt.alias)
+		}
+	}
+}
+
+func TestReadDefaultModel(t *testing.T) {
+	savedEnv := os.Getenv("PI_CODING_AGENT_DIR")
+	t.Cleanup(func() {
+		if savedEnv != "" {
+			_ = os.Setenv("PI_CODING_AGENT_DIR", savedEnv)
+		} else {
+			_ = os.Unsetenv("PI_CODING_AGENT_DIR")
+		}
+	})
+
+	tmpDir := t.TempDir()
+	t.Setenv("PI_CODING_AGENT_DIR", tmpDir)
+
+	// No file -> error.
+	_, err := readDefaultModel()
+	if err == nil {
+		t.Error("expected error for missing settings.json")
+	}
+
+	// Write with both defaultProvider and defaultModel.
+	settings := map[string]any{
+		"defaultModel":    "family-a/model-beta",
+		"defaultProvider": "provider-a",
+	}
+	data, _ := json.Marshal(settings)
+	if err := os.WriteFile(filepath.Join(tmpDir, "settings.json"), data, 0o644); err != nil {
+		t.Fatalf("write settings: %v", err)
+	}
+
+	model, err := readDefaultModel()
+	if err != nil {
+		t.Fatalf("readDefaultModel() error = %v", err)
+	}
+	if model != "family-a/model-beta" {
+		t.Errorf("defaultModel = %q, want %q", model, "family-a/model-beta")
+	}
+
+	// With model without provider prefix and defaultProvider set.
+	settings2 := map[string]any{
+		"defaultModel":    "gpt-4o",
+		"defaultProvider": "provider-b",
+	}
+	data2, _ := json.Marshal(settings2)
+	if err := os.WriteFile(filepath.Join(tmpDir, "settings.json"), data2, 0o644); err != nil {
+		t.Fatalf("write settings2: %v", err)
+	}
+
+	model2, _ := readDefaultModel()
+	if model2 != "provider-b/gpt-4o" {
+		t.Errorf("qualified defaultModel = %q, want %q", model2, "provider-b/gpt-4o")
+	}
+}
+
+func TestPiSettingsDir(t *testing.T) {
+	savedEnv := os.Getenv("PI_CODING_AGENT_DIR")
+	defer func() {
+		if savedEnv != "" {
+			_ = os.Setenv("PI_CODING_AGENT_DIR", savedEnv)
+		} else {
+			_ = os.Unsetenv("PI_CODING_AGENT_DIR")
+		}
+	}()
+
+	// With env var set.
+	t.Setenv("PI_CODING_AGENT_DIR", "/custom/pi/path")
+	if d := piSettingsDir(); d != "/custom/pi/path" {
+		t.Errorf("piSettingsDir() = %q, want /custom/pi/path", d)
+	}
+
+	// Unset env var -> default.
+	_ = os.Unsetenv("PI_CODING_AGENT_DIR")
+	home, _ := os.UserHomeDir()
+	want := filepath.Join(home, ".pi", "agent")
+	if d := piSettingsDir(); d != want {
+		t.Errorf("piSettingsDir() = %q, want %q", d, want)
+	}
+}
+
+func TestSettingsPath(t *testing.T) {
+	savedEnv := os.Getenv("PI_CODING_AGENT_DIR")
+	defer func() {
+		if savedEnv != "" {
+			_ = os.Setenv("PI_CODING_AGENT_DIR", savedEnv)
+		} else {
+			_ = os.Unsetenv("PI_CODING_AGENT_DIR")
+		}
+	}()
+
+	t.Setenv("PI_CODING_AGENT_DIR", "/custom")
+	if p := settingsPath(); p != "/custom/settings.json" {
+		t.Errorf("settingsPath() = %q, want /custom/settings.json", p)
+	}
+}
+
+func TestAgent_SetSessionEnv(t *testing.T) {
+	a := &Agent{}
+	a.SetSessionEnv([]string{"FOO=bar", "BAZ=qux"})
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if len(a.sessionEnv) != 2 {
+		t.Errorf("sessionEnv len = %d, want 2", len(a.sessionEnv))
+	}
+}
+
+func TestAgent_ListSessions(t *testing.T) {
+	a := &Agent{}
+	sessions, err := a.ListSessions(context.Background())
+	if err != nil {
+		t.Errorf("ListSessions() error = %v", err)
+	}
+	if sessions != nil {
+		t.Errorf("ListSessions() = %v, want nil", sessions)
+	}
+}
+
+func TestAgent_Stop(t *testing.T) {
+	a := &Agent{}
+	if err := a.Stop(); err != nil {
+		t.Errorf("Stop() error = %v", err)
+	}
+}
+
+func TestAgent_PermissionModes(t *testing.T) {
+	a := &Agent{}
+	modes := a.PermissionModes()
+	if len(modes) != 2 {
+		t.Fatalf("PermissionModes() len = %d, want 2", len(modes))
+	}
+	if modes[0].Key != "default" {
+		t.Errorf("modes[0].Key = %q", modes[0].Key)
+	}
+	if modes[1].Key != "yolo" {
+		t.Errorf("modes[1].Key = %q", modes[1].Key)
+	}
+}
+
+func TestAgent_MemoryFiles(t *testing.T) {
+	a := &Agent{workDir: "/tmp/test-project"}
+	proj := a.ProjectMemoryFile()
+	if !strings.HasSuffix(proj, "AGENTS.md") {
+		t.Errorf("ProjectMemoryFile() = %q, want suffix AGENTS.md", proj)
+	}
+	if !strings.Contains(proj, "test-project") {
+		t.Errorf("ProjectMemoryFile() = %q, want to contain work_dir", proj)
+	}
+
+	global := a.GlobalMemoryFile()
+	if !strings.HasSuffix(global, filepath.Join(".pi", "agent", "AGENTS.md")) {
+		t.Errorf("GlobalMemoryFile() = %q", global)
+	}
+}
+
+func TestAgent_StartSession(t *testing.T) {
+	a := &Agent{cmd: "echo", workDir: "/tmp", model: "test-model", mode: "yolo"}
+	a.SetSessionEnv([]string{"TEST_VAR=1"})
+
+	sess, err := a.StartSession(context.Background(), "resume-123")
+	if err != nil {
+		t.Fatalf("StartSession() error = %v", err)
+	}
+	defer sess.Close()
+
+	ps := sess.(*piSession)
+	if ps.cmd != "echo" {
+		t.Errorf("cmd = %q", ps.cmd)
+	}
+	if ps.model != "test-model" {
+		t.Errorf("model = %q", ps.model)
+	}
+	if ps.mode != "yolo" {
+		t.Errorf("mode = %q", ps.mode)
+	}
+	if ps.CurrentSessionID() != "resume-123" {
+		t.Errorf("sessionID = %q, want resume-123", ps.CurrentSessionID())
+	}
+	if !ps.Alive() {
+		t.Error("session should be alive")
+	}
+}
+
+// ── extractToolInput ─────────────────────────────────────────
+
+func TestExtractToolInput(t *testing.T) {
+	tests := []struct {
+		name string
+		item map[string]any
+		want string
+	}{
+		{"nil arguments", map[string]any{}, ""},
+		{"description", map[string]any{"arguments": map[string]any{"description": "List files"}}, "List files"},
+		{"command", map[string]any{"arguments": map[string]any{"command": "ls -la"}}, "ls -la"},
+		{"file_path", map[string]any{"arguments": map[string]any{"file_path": "/tmp/foo.go"}}, "/tmp/foo.go"},
+		{"pattern", map[string]any{"arguments": map[string]any{"pattern": "*.go"}}, "*.go"},
+		{"query", map[string]any{"arguments": map[string]any{"query": "find errors"}}, "find errors"},
+		{"description takes priority", map[string]any{"arguments": map[string]any{
+			"description": "desc", "command": "cmd",
+		}}, "desc"},
+		{"fallback to json", map[string]any{"arguments": map[string]any{"foo": "bar"}}, `{"foo":"bar"}`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := extractToolInput(tt.item)
+			if got != tt.want {
+				t.Errorf("extractToolInput() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestExtractToolInput_LongFallbackTruncated(t *testing.T) {
+	longVal := strings.Repeat("x", 300)
+	item := map[string]any{"arguments": map[string]any{"data": longVal}}
+	got := extractToolInput(item)
+	if len(got) > 210 { // 200 + "..."
+		t.Errorf("expected truncated output, got len=%d", len(got))
+	}
+	if !strings.HasSuffix(got, "...") {
+		t.Error("expected '...' suffix")
+	}
+}
+
+// ── truncStr ─────────────────────────────────────────────────
+
+func TestTruncStr(t *testing.T) {
+	tests := []struct {
+		in       string
+		max      int
+		want     string
+		wantSame bool
+	}{
+		{"hello", 10, "hello", true},
+		{"hello", 5, "hello", true},
+		{"hello", 3, "hel...", false},
+		{"", 5, "", true},
+		{"日本語テスト", 3, "日本語...", false},
+		{"日本語テスト", 10, "日本語テスト", true},
+	}
+	for _, tt := range tests {
+		got := truncStr(tt.in, tt.max)
+		if got != tt.want {
+			t.Errorf("truncStr(%q, %d) = %q, want %q", tt.in, tt.max, got, tt.want)
+		}
+	}
+}
+
+// ── saveImagesToDisk ─────────────────────────────────────────
+
+func TestSaveImagesToDisk(t *testing.T) {
+	attachDir := filepath.Join(t.TempDir(), ".cc-connect", "attachments", "pi-test")
+	images := []core.ImageAttachment{
+		{MimeType: "image/png", Data: []byte("png-data"), FileName: "test.png"},
+		{MimeType: "image/jpeg", Data: []byte("jpg-data")},
+		{MimeType: "image/gif", Data: []byte("gif-data")},
+		{MimeType: "image/webp", Data: []byte("webp-data")},
+		{MimeType: "image/bmp", Data: []byte("bmp-data")}, // unknown mime → .png default
+	}
+
+	paths := saveImagesToDisk(attachDir, images)
+	if len(paths) != 5 {
+		t.Fatalf("got %d paths, want 5", len(paths))
+	}
+
+	// First file should use the provided filename.
+	if filepath.Base(paths[0]) != "test.png" {
+		t.Errorf("paths[0] base = %q, want test.png", filepath.Base(paths[0]))
+	}
+
+	// Check extensions of auto-named files.
+	if !strings.HasSuffix(paths[1], ".jpg") {
+		t.Errorf("jpeg path = %q, want .jpg suffix", paths[1])
+	}
+	if !strings.HasSuffix(paths[2], ".gif") {
+		t.Errorf("gif path = %q, want .gif suffix", paths[2])
+	}
+	if !strings.HasSuffix(paths[3], ".webp") {
+		t.Errorf("webp path = %q, want .webp suffix", paths[3])
+	}
+	if !strings.HasSuffix(paths[4], ".png") {
+		t.Errorf("unknown mime path = %q, want .png suffix", paths[4])
+	}
+
+	// Verify file contents.
+	data, err := os.ReadFile(paths[0])
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if string(data) != "png-data" {
+		t.Errorf("file content = %q", data)
+	}
+}
+
+func TestSaveImagesToDisk_Empty(t *testing.T) {
+	paths := saveImagesToDisk(t.TempDir(), nil)
+	if len(paths) != 0 {
+		t.Errorf("expected empty, got %d", len(paths))
+	}
+}
+
+// TestSaveImagesToDisk_RejectsPathTraversal is a regression test for a path
+// traversal vulnerability in saveImagesToDisk: the user-supplied
+// ImageAttachment.FileName (sourced from IM upload metadata) was passed
+// directly to filepath.Join, so a malicious uploader could escape the
+// attachments directory by using `../` segments. This mirrors the same
+// issue and fix in core.SaveFilesToDisk.
+func TestSaveImagesToDisk_RejectsPathTraversal(t *testing.T) {
+	workDir := t.TempDir()
+	attachDir := filepath.Join(workDir, ".cc-connect", "attachments")
+
+	images := []core.ImageAttachment{
+		// Two levels up — escapes attachments/ and .cc-connect/.
+		{MimeType: "image/png", Data: []byte("payload"), FileName: "../../escape.png"},
+		// Three levels up — would land outside workDir entirely.
+		{MimeType: "image/png", Data: []byte("payload"), FileName: "../../../way-up.png"},
+		// Windows-style separators must also be stripped on Linux.
+		{MimeType: "image/png", Data: []byte("payload"), FileName: `..\..\winescape.png`},
+		// Plain name still works.
+		{MimeType: "image/png", Data: []byte("payload"), FileName: "ok.png"},
+		// "." sanitizes to empty so the generated-name fallback kicks in,
+		// not a write to the attachments directory itself.
+		{MimeType: "image/png", Data: []byte("payload"), FileName: "."},
+	}
+
+	paths := saveImagesToDisk(attachDir, images)
+
+	// Every returned path must live inside attachDir.
+	for _, p := range paths {
+		if !strings.HasPrefix(p, attachDir+string(filepath.Separator)) {
+			t.Errorf("saveImagesToDisk wrote outside attachments dir: %q (attachDir=%q)", p, attachDir)
+		}
+	}
+
+	// Walk workDir and assert no file exists outside attachDir.
+	if err := filepath.Walk(workDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil || info.IsDir() {
+			return nil
+		}
+		if !strings.HasPrefix(path, attachDir+string(filepath.Separator)) {
+			t.Errorf("found stray attachment outside attachments dir: %q", path)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("walk: %v", err)
+	}
+
+	// Sanity: legitimate "ok.png" must still have been saved.
+	if _, err := os.Stat(filepath.Join(attachDir, "ok.png")); err != nil {
+		t.Errorf("legitimate ok.png not saved: %v", err)
+	}
+}
+
+func TestSanitizePiAttachmentName(t *testing.T) {
+	tests := []struct {
+		in, want string
+	}{
+		{"image.png", "image.png"},
+		{"subdir/file.png", "file.png"},
+		{"../../escape.png", "escape.png"},
+		{`..\..\winescape.png`, "winescape.png"},
+		{"/etc/passwd", "passwd"},
+		{"..", ""},
+		{".", ""},
+		{"", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.in, func(t *testing.T) {
+			got := sanitizePiAttachmentName(tt.in)
+			if got != tt.want {
+				t.Errorf("sanitizePiAttachmentName(%q) = %q, want %q", tt.in, got, tt.want)
+			}
+		})
+	}
+}
+
+// ── cleanAttachments ─────────────────────────────────────────
+
+func TestCleanAttachments(t *testing.T) {
+	tmpDir := t.TempDir()
+	attachDir := filepath.Join(tmpDir, ".cc-connect", "attachments")
+	os.MkdirAll(attachDir, 0o755)
+
+	// Create some files.
+	os.WriteFile(filepath.Join(attachDir, "old1.png"), []byte("data"), 0o644)
+	os.WriteFile(filepath.Join(attachDir, "old2.jpg"), []byte("data"), 0o644)
+
+	// Verify files exist.
+	entries, _ := os.ReadDir(attachDir)
+	if len(entries) != 2 {
+		t.Fatalf("expected 2 files, got %d", len(entries))
+	}
+
+	cleanAttachments(attachDir)
+
+	// Directory should be removed.
+	if _, err := os.Stat(attachDir); !os.IsNotExist(err) {
+		t.Errorf("expected attachments dir removed after clean, got err=%v", err)
+	}
+}
+
+func TestCleanAttachments_NonexistentDir(t *testing.T) {
+	// Should not panic or error on non-existent directory.
+	cleanAttachments("/nonexistent/path/xyz")
+}
+
+func TestPiSessionAttachmentDirsAreIsolated(t *testing.T) {
+	workDir := t.TempDir()
+	s1, err := newPiSession(context.Background(), "pi", workDir, "", "", "", "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s2, err := newPiSession(context.Background(), "pi", workDir, "", "", "", "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s1.attachDir == s2.attachDir {
+		t.Fatalf("expected distinct attachment dirs, got %q", s1.attachDir)
+	}
+
+	if err := os.MkdirAll(s1.attachDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(s2.attachDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(s1.attachDir, "one.txt"), []byte("one"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(s2.attachDir, "two.txt"), []byte("two"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cleanAttachments(s1.attachDir)
+
+	if _, err := os.Stat(filepath.Join(s2.attachDir, "two.txt")); err != nil {
+		t.Fatalf("cleaning one session removed another session's attachment: %v", err)
+	}
+}
+
+// ── handleEvent ──────────────────────────────────────────────
+
+func newTestSession() *piSession {
+	ctx, cancel := context.WithCancel(context.Background())
+	s := &piSession{
+		events: make(chan core.Event, 64),
+		ctx:    ctx,
+		cancel: cancel,
+	}
+	s.alive.Store(true)
+	return s
+}
+
+func drainEvents(s *piSession) []core.Event {
+	var evts []core.Event
+	for {
+		select {
+		case e := <-s.events:
+			evts = append(evts, e)
+		default:
+			return evts
+		}
+	}
+}
+
+func TestHandleEvent_Session(t *testing.T) {
+	s := newTestSession()
+	defer s.cancel()
+
+	s.handleEvent(map[string]any{"type": "session", "id": "sess-abc-123"})
+	if s.CurrentSessionID() != "sess-abc-123" {
+		t.Errorf("sessionID = %q", s.CurrentSessionID())
+	}
+}
+
+func TestHandleEvent_SessionEmptyID(t *testing.T) {
+	s := newTestSession()
+	defer s.cancel()
+
+	s.handleEvent(map[string]any{"type": "session", "id": ""})
+	if s.CurrentSessionID() != "" {
+		t.Errorf("sessionID = %q, want empty", s.CurrentSessionID())
+	}
+}
+
+func TestHandleEvent_SessionNoID(t *testing.T) {
+	s := newTestSession()
+	defer s.cancel()
+
+	s.handleEvent(map[string]any{"type": "session"})
+	if s.CurrentSessionID() != "" {
+		t.Errorf("sessionID = %q, want empty", s.CurrentSessionID())
+	}
+}
+
+func TestHandleEvent_LifecycleEventsNoOp(t *testing.T) {
+	s := newTestSession()
+	defer s.cancel()
+
+	for _, evType := range []string{"agent_start", "agent_end", "turn_start", "turn_end", "message_start"} {
+		s.handleEvent(map[string]any{"type": evType})
+	}
+	evts := drainEvents(s)
+	if len(evts) != 0 {
+		t.Errorf("expected no events, got %d", len(evts))
+	}
+}
+
+func TestHandleEvent_UnhandledType(t *testing.T) {
+	s := newTestSession()
+	defer s.cancel()
+
+	s.handleEvent(map[string]any{"type": "unknown_event"})
+	evts := drainEvents(s)
+	if len(evts) != 0 {
+		t.Errorf("expected no events, got %d", len(evts))
+	}
+}
+
+// ── handleMessageUpdate: text_delta ──────────────────────────
+
+func TestHandleMessageUpdate_TextDelta(t *testing.T) {
+	s := newTestSession()
+	defer s.cancel()
+
+	s.handleEvent(map[string]any{
+		"type": "message_update",
+		"assistantMessageEvent": map[string]any{
+			"type":  "text_delta",
+			"delta": "Hello world",
+		},
+	})
+
+	evts := drainEvents(s)
+	if len(evts) != 1 {
+		t.Fatalf("got %d events, want 1", len(evts))
+	}
+	if evts[0].Type != core.EventText || evts[0].Content != "Hello world" {
+		t.Errorf("event = %+v", evts[0])
+	}
+}
+
+func TestHandleMessageUpdate_TextDeltaEmpty(t *testing.T) {
+	s := newTestSession()
+	defer s.cancel()
+
+	s.handleEvent(map[string]any{
+		"type": "message_update",
+		"assistantMessageEvent": map[string]any{
+			"type":  "text_delta",
+			"delta": "",
+		},
+	})
+
+	evts := drainEvents(s)
+	if len(evts) != 0 {
+		t.Errorf("expected no events for empty delta, got %d", len(evts))
+	}
+}
+
+// ── handleMessageUpdate: thinking accumulation ───────────────
+
+func TestHandleMessageUpdate_ThinkingAccumulation(t *testing.T) {
+	s := newTestSession()
+	defer s.cancel()
+
+	// Multiple thinking deltas should be accumulated.
+	s.handleEvent(map[string]any{
+		"type":                  "message_update",
+		"assistantMessageEvent": map[string]any{"type": "thinking_delta", "delta": "Let me "},
+	})
+	s.handleEvent(map[string]any{
+		"type":                  "message_update",
+		"assistantMessageEvent": map[string]any{"type": "thinking_delta", "delta": "think about "},
+	})
+	s.handleEvent(map[string]any{
+		"type":                  "message_update",
+		"assistantMessageEvent": map[string]any{"type": "thinking_delta", "delta": "this."},
+	})
+
+	// No events should be emitted yet.
+	evts := drainEvents(s)
+	if len(evts) != 0 {
+		t.Fatalf("expected no events before thinking_end, got %d", len(evts))
+	}
+
+	// thinking_end triggers the accumulated event.
+	s.handleEvent(map[string]any{
+		"type":                  "message_update",
+		"assistantMessageEvent": map[string]any{"type": "thinking_end"},
+	})
+
+	evts = drainEvents(s)
+	if len(evts) != 1 {
+		t.Fatalf("got %d events, want 1", len(evts))
+	}
+	if evts[0].Type != core.EventThinking {
+		t.Errorf("type = %s, want EventThinking", evts[0].Type)
+	}
+	if evts[0].Content != "Let me think about this." {
+		t.Errorf("content = %q", evts[0].Content)
+	}
+}
+
+func TestHandleMessageUpdate_ThinkingEndEmpty(t *testing.T) {
+	s := newTestSession()
+	defer s.cancel()
+
+	// thinking_end with no prior deltas should not emit.
+	s.handleEvent(map[string]any{
+		"type":                  "message_update",
+		"assistantMessageEvent": map[string]any{"type": "thinking_end"},
+	})
+
+	evts := drainEvents(s)
+	if len(evts) != 0 {
+		t.Errorf("expected no events for empty thinking, got %d", len(evts))
+	}
+}
+
+func TestHandleMessageUpdate_ThinkingDeltaEmpty(t *testing.T) {
+	s := newTestSession()
+	defer s.cancel()
+
+	// Empty deltas should not grow the buffer.
+	s.handleEvent(map[string]any{
+		"type":                  "message_update",
+		"assistantMessageEvent": map[string]any{"type": "thinking_delta", "delta": ""},
+	})
+
+	if s.thinkingBuf.Len() != 0 {
+		t.Errorf("thinkingBuf.Len() = %d, want 0", s.thinkingBuf.Len())
+	}
+}
+
+// ── handleMessageUpdate: toolcall_end ────────────────────────
+
+func TestHandleMessageUpdate_ToolcallEnd(t *testing.T) {
+	s := newTestSession()
+	defer s.cancel()
+
+	s.handleEvent(map[string]any{
+		"type": "message_update",
+		"assistantMessageEvent": map[string]any{
+			"type":         "toolcall_end",
+			"contentIndex": float64(1),
+			"message": map[string]any{
+				"content": []any{
+					map[string]any{"type": "thinking", "thinking": "..."},
+					map[string]any{
+						"type":      "toolCall",
+						"name":      "bash",
+						"arguments": map[string]any{"command": "ls -la"},
+					},
+				},
+			},
+		},
+	})
+
+	evts := drainEvents(s)
+	if len(evts) != 1 {
+		t.Fatalf("got %d events, want 1", len(evts))
+	}
+	if evts[0].Type != core.EventToolUse {
+		t.Errorf("type = %s", evts[0].Type)
+	}
+	if evts[0].ToolName != "bash" {
+		t.Errorf("toolName = %q", evts[0].ToolName)
+	}
+	if evts[0].ToolInput != "ls -la" {
+		t.Errorf("toolInput = %q", evts[0].ToolInput)
+	}
+}
+
+func TestHandleMessageUpdate_ToolcallEnd_UsesPartialFallback(t *testing.T) {
+	s := newTestSession()
+	defer s.cancel()
+
+	s.handleEvent(map[string]any{
+		"type": "message_update",
+		"assistantMessageEvent": map[string]any{
+			"type":         "toolcall_end",
+			"contentIndex": float64(0),
+			"partial": map[string]any{
+				"content": []any{
+					map[string]any{
+						"type":      "toolCall",
+						"name":      "read",
+						"arguments": map[string]any{"file_path": "/tmp/foo.txt"},
+					},
+				},
+			},
+		},
+	})
+
+	evts := drainEvents(s)
+	if len(evts) != 1 {
+		t.Fatalf("got %d events, want 1", len(evts))
+	}
+	if evts[0].ToolName != "read" || evts[0].ToolInput != "/tmp/foo.txt" {
+		t.Errorf("event = %+v", evts[0])
+	}
+}
+
+func TestHandleMessageUpdate_ToolcallEnd_NonToolCallItem(t *testing.T) {
+	s := newTestSession()
+	defer s.cancel()
+
+	s.handleEvent(map[string]any{
+		"type": "message_update",
+		"assistantMessageEvent": map[string]any{
+			"type":         "toolcall_end",
+			"contentIndex": float64(0),
+			"message": map[string]any{
+				"content": []any{
+					map[string]any{"type": "text", "text": "hello"},
+				},
+			},
+		},
+	})
+
+	evts := drainEvents(s)
+	if len(evts) != 0 {
+		t.Errorf("expected no events for non-toolCall item, got %d", len(evts))
+	}
+}
+
+func TestHandleMessageUpdate_ToolcallEnd_OutOfBoundsIndex(t *testing.T) {
+	s := newTestSession()
+	defer s.cancel()
+
+	s.handleEvent(map[string]any{
+		"type": "message_update",
+		"assistantMessageEvent": map[string]any{
+			"type":         "toolcall_end",
+			"contentIndex": float64(5),
+			"message": map[string]any{
+				"content": []any{
+					map[string]any{"type": "toolCall", "name": "bash"},
+				},
+			},
+		},
+	})
+
+	evts := drainEvents(s)
+	if len(evts) != 0 {
+		t.Errorf("expected no events for out-of-bounds index, got %d", len(evts))
+	}
+}
+
+func TestHandleMessageUpdate_ToolcallEnd_NilMessage(t *testing.T) {
+	s := newTestSession()
+	defer s.cancel()
+
+	s.handleEvent(map[string]any{
+		"type": "message_update",
+		"assistantMessageEvent": map[string]any{
+			"type": "toolcall_end",
+			// no "message" or "partial"
+		},
+	})
+
+	evts := drainEvents(s)
+	if len(evts) != 0 {
+		t.Errorf("expected no events, got %d", len(evts))
+	}
+}
+
+func TestHandleMessageUpdate_NilAssistantEvent(t *testing.T) {
+	s := newTestSession()
+	defer s.cancel()
+
+	s.handleEvent(map[string]any{"type": "message_update"})
+
+	evts := drainEvents(s)
+	if len(evts) != 0 {
+		t.Errorf("expected no events, got %d", len(evts))
+	}
+}
+
+func TestHandleMessageUpdate_UnknownSubType(t *testing.T) {
+	s := newTestSession()
+	defer s.cancel()
+
+	s.handleEvent(map[string]any{
+		"type": "message_update",
+		"assistantMessageEvent": map[string]any{
+			"type": "some_unknown_delta",
+		},
+	})
+
+	evts := drainEvents(s)
+	if len(evts) != 0 {
+		t.Errorf("expected no events for unknown sub-type, got %d", len(evts))
+	}
+}
+
+// ── handleMessageEnd ─────────────────────────────────────────
+
+func TestHandleMessageEnd_ToolResult(t *testing.T) {
+	s := newTestSession()
+	defer s.cancel()
+
+	s.handleEvent(map[string]any{
+		"type": "message_end",
+		"message": map[string]any{
+			"role":     "toolResult",
+			"toolName": "bash",
+			"content": []any{
+				map[string]any{"type": "text", "text": "file1.go\nfile2.go"},
+			},
+		},
+	})
+
+	evts := drainEvents(s)
+	if len(evts) != 1 {
+		t.Fatalf("got %d events, want 1", len(evts))
+	}
+	if evts[0].Type != core.EventToolResult {
+		t.Errorf("type = %s", evts[0].Type)
+	}
+	if evts[0].ToolName != "bash" {
+		t.Errorf("toolName = %q", evts[0].ToolName)
+	}
+	if evts[0].Content != "file1.go\nfile2.go" {
+		t.Errorf("content = %q", evts[0].Content)
+	}
+}
+
+func TestHandleMessageEnd_ToolResultLongOutput(t *testing.T) {
+	s := newTestSession()
+	defer s.cancel()
+
+	longOutput := strings.Repeat("x", 600)
+	s.handleEvent(map[string]any{
+		"type": "message_end",
+		"message": map[string]any{
+			"role":     "toolResult",
+			"toolName": "bash",
+			"content": []any{
+				map[string]any{"type": "text", "text": longOutput},
+			},
+		},
+	})
+
+	evts := drainEvents(s)
+	if len(evts) != 1 {
+		t.Fatalf("got %d events, want 1", len(evts))
+	}
+	if len(evts[0].Content) > 510 {
+		t.Errorf("content should be truncated, got len=%d", len(evts[0].Content))
+	}
+}
+
+func TestHandleMessageEnd_ToolResultEmptyContent(t *testing.T) {
+	s := newTestSession()
+	defer s.cancel()
+
+	s.handleEvent(map[string]any{
+		"type": "message_end",
+		"message": map[string]any{
+			"role":     "toolResult",
+			"toolName": "bash",
+			"content":  []any{},
+		},
+	})
+
+	evts := drainEvents(s)
+	if len(evts) != 1 {
+		t.Fatalf("got %d events, want 1", len(evts))
+	}
+	if evts[0].Content != "" {
+		t.Errorf("content = %q, want empty", evts[0].Content)
+	}
+}
+
+func TestHandleMessageEnd_AssistantError(t *testing.T) {
+	s := newTestSession()
+	defer s.cancel()
+
+	s.handleEvent(map[string]any{
+		"type": "message_end",
+		"message": map[string]any{
+			"role":         "assistant",
+			"errorMessage": "400 model not supported",
+		},
+	})
+
+	evts := drainEvents(s)
+	if len(evts) != 1 {
+		t.Fatalf("got %d events, want 1", len(evts))
+	}
+	if evts[0].Type != core.EventError {
+		t.Errorf("type = %s", evts[0].Type)
+	}
+	if evts[0].Error == nil || !strings.Contains(evts[0].Error.Error(), "400") {
+		t.Errorf("error = %v", evts[0].Error)
+	}
+}
+
+func TestHandleMessageEnd_AssistantNoError(t *testing.T) {
+	s := newTestSession()
+	defer s.cancel()
+
+	s.handleEvent(map[string]any{
+		"type": "message_end",
+		"message": map[string]any{
+			"role": "assistant",
+		},
+	})
+
+	evts := drainEvents(s)
+	if len(evts) != 0 {
+		t.Errorf("expected no events for assistant without error, got %d", len(evts))
+	}
+}
+
+func TestHandleMessageEnd_NilMessage(t *testing.T) {
+	s := newTestSession()
+	defer s.cancel()
+
+	s.handleEvent(map[string]any{"type": "message_end"})
+
+	evts := drainEvents(s)
+	if len(evts) != 0 {
+		t.Errorf("expected no events, got %d", len(evts))
+	}
+}
+
+func TestHandleMessageEnd_UserRole(t *testing.T) {
+	s := newTestSession()
+	defer s.cancel()
+
+	s.handleEvent(map[string]any{
+		"type": "message_end",
+		"message": map[string]any{
+			"role": "user",
+		},
+	})
+
+	evts := drainEvents(s)
+	if len(evts) != 0 {
+		t.Errorf("expected no events for user role, got %d", len(evts))
+	}
+}
+
+// ── piSession lifecycle ──────────────────────────────────────
+
+func TestPiSession_NewWithResumeID(t *testing.T) {
+	s, err := newPiSession(context.Background(), "echo", "/tmp", "model", "default", "", "resume-id", nil)
+	if err != nil {
+		t.Fatalf("newPiSession: %v", err)
+	}
+	defer s.Close()
+
+	if s.CurrentSessionID() != "resume-id" {
+		t.Errorf("sessionID = %q", s.CurrentSessionID())
+	}
+}
+
+func TestPiSession_ContinueSessionTreatedAsFresh(t *testing.T) {
+	// ContinueSession ("__continue__") is a sentinel used by the engine to tell
+	// Claude Code to pick up the latest CLI session via --continue. Agents that
+	// don't support --continue must treat it as "" (fresh session), otherwise
+	// they pass the literal "__continue__" as a session ID which always fails.
+	s, err := newPiSession(context.Background(), "echo", "/tmp", "", "default", "", core.ContinueSession, nil)
+	if err != nil {
+		t.Fatalf("newPiSession: %v", err)
+	}
+	defer s.Close()
+
+	if got := s.CurrentSessionID(); got != "" {
+		t.Errorf("ContinueSession should be treated as fresh: sessionID = %q, want empty", got)
+	}
+}
+
+func TestPiSession_NewWithoutResumeID(t *testing.T) {
+	s, err := newPiSession(context.Background(), "echo", "/tmp", "", "default", "", "", nil)
+	if err != nil {
+		t.Fatalf("newPiSession: %v", err)
+	}
+	defer s.Close()
+
+	if s.CurrentSessionID() != "" {
+		t.Errorf("sessionID = %q, want empty", s.CurrentSessionID())
+	}
+}
+
+func TestPiSession_SendWhenClosed(t *testing.T) {
+	s, _ := newPiSession(context.Background(), "echo", "/tmp", "", "default", "", "", nil)
+	s.Close()
+
+	err := s.Send("hello", nil, nil)
+	if err == nil || !strings.Contains(err.Error(), "closed") {
+		t.Errorf("expected 'closed' error, got %v", err)
+	}
+}
+
+func TestPiSession_RespondPermission(t *testing.T) {
+	s := newTestSession()
+	defer s.cancel()
+
+	if err := s.RespondPermission("id", core.PermissionResult{}); err != nil {
+		t.Errorf("RespondPermission() error = %v", err)
+	}
+}
+
+func TestPiSession_Events(t *testing.T) {
+	s := newTestSession()
+	defer s.cancel()
+
+	ch := s.Events()
+	if ch == nil {
+		t.Fatal("Events() returned nil")
+	}
+}
+
+func TestPiSession_Close(t *testing.T) {
+	s, _ := newPiSession(context.Background(), "echo", "/tmp", "", "default", "", "", nil)
+
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	if s.Alive() {
+		t.Error("session should not be alive after Close()")
+	}
+}
+
+// ── Full event stream simulation ─────────────────────────────
+
+func TestHandleEvent_FullConversation(t *testing.T) {
+	s := newTestSession()
+	defer s.cancel()
+
+	// Simulate a full pi conversation: session → thinking → text → tool → tool result → text → done
+	events := []map[string]any{
+		{"type": "session", "id": "conv-123"},
+		{"type": "agent_start"},
+		{"type": "turn_start"},
+		{"type": "message_start"},
+		{"type": "message_update", "assistantMessageEvent": map[string]any{
+			"type": "thinking_delta", "delta": "I need to ",
+		}},
+		{"type": "message_update", "assistantMessageEvent": map[string]any{
+			"type": "thinking_delta", "delta": "list files.",
+		}},
+		{"type": "message_update", "assistantMessageEvent": map[string]any{
+			"type": "thinking_end",
+		}},
+		{"type": "message_update", "assistantMessageEvent": map[string]any{
+			"type":         "toolcall_end",
+			"contentIndex": float64(1),
+			"message": map[string]any{
+				"content": []any{
+					map[string]any{"type": "thinking"},
+					map[string]any{"type": "toolCall", "name": "bash", "arguments": map[string]any{"command": "ls"}},
+				},
+			},
+		}},
+		{"type": "message_end", "message": map[string]any{
+			"role": "assistant", "stopReason": "toolUse",
+		}},
+		{"type": "message_end", "message": map[string]any{
+			"role": "toolResult", "toolName": "bash",
+			"content": []any{map[string]any{"type": "text", "text": "file1.go"}},
+		}},
+		{"type": "turn_end"},
+		{"type": "turn_start"},
+		{"type": "message_update", "assistantMessageEvent": map[string]any{
+			"type": "text_delta", "delta": "Here are your files.",
+		}},
+		{"type": "message_end", "message": map[string]any{
+			"role": "assistant", "stopReason": "stop",
+		}},
+		{"type": "turn_end"},
+		{"type": "agent_end"},
+	}
+
+	for _, ev := range events {
+		s.handleEvent(ev)
+	}
+
+	evts := drainEvents(s)
+
+	// Expected: thinking, tool_use, tool_result, text
+	if len(evts) != 4 {
+		var types []string
+		for _, e := range evts {
+			types = append(types, string(e.Type))
+		}
+		t.Fatalf("got %d events %v, want 4", len(evts), types)
+	}
+
+	if evts[0].Type != core.EventThinking || evts[0].Content != "I need to list files." {
+		t.Errorf("evts[0] = %+v", evts[0])
+	}
+	if evts[1].Type != core.EventToolUse || evts[1].ToolName != "bash" {
+		t.Errorf("evts[1] = %+v", evts[1])
+	}
+	if evts[2].Type != core.EventToolResult || evts[2].Content != "file1.go" {
+		t.Errorf("evts[2] = %+v", evts[2])
+	}
+	if evts[3].Type != core.EventText || evts[3].Content != "Here are your files." {
+		t.Errorf("evts[3] = %+v", evts[3])
+	}
+
+	if s.CurrentSessionID() != "conv-123" {
+		t.Errorf("sessionID = %q", s.CurrentSessionID())
+	}
+}
+
+// ── readLoop with real process ───────────────────────────────
+
+func TestPiSession_ReadLoopWithEcho(t *testing.T) {
+	// Use sh -c to simulate pi JSON output on stdout.
+	sessionEvent := map[string]any{"type": "session", "id": "echo-sess"}
+	textEvent := map[string]any{
+		"type": "message_update",
+		"assistantMessageEvent": map[string]any{
+			"type":  "text_delta",
+			"delta": "hi",
+		},
+	}
+	line1, _ := json.Marshal(sessionEvent)
+	line2, _ := json.Marshal(textEvent)
+
+	s, err := newPiSession(context.Background(), "sh", "/tmp", "", "default", "", "", nil)
+	if err != nil {
+		t.Fatalf("newPiSession: %v", err)
+	}
+
+	// sh -c 'echo ...; echo ...' will output our JSON lines.
+	// We need to override how Send builds args. Instead, call readLoop directly.
+	// Actually, just use Send with sh -c and craft the prompt as the script.
+	script := "echo '" + string(line1) + "'; echo '" + string(line2) + "'"
+
+	// Manually build the command since Send adds extra flags for pi.
+	s.cmd = "sh"
+	s.model = "" // prevent --model flag
+
+	// Directly test readLoop via Send by crafting args that sh understands.
+	// Send will run: sh --mode json -p <script> which sh won't understand.
+	// Instead, test readLoop directly.
+	ctx := s.ctx
+	cmd := exec.CommandContext(ctx, "sh", "-c", script)
+	cmd.Dir = "/tmp"
+
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatalf("StdoutPipe: %v", err)
+	}
+	var stderrBuf bytes.Buffer
+	cmd.Stderr = &stderrBuf
+
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	s.wg.Add(1)
+	go s.readLoop(cmd, stdout, &stderrBuf)
+
+	// Collect events with timeout.
+	var evts []core.Event
+	timeout := time.After(5 * time.Second)
+loop:
+	for {
+		select {
+		case ev, ok := <-s.Events():
+			if !ok {
+				break loop
+			}
+			evts = append(evts, ev)
+			if ev.Type == core.EventResult {
+				break loop
+			}
+		case <-timeout:
+			t.Fatal("timeout waiting for events")
+		}
+	}
+
+	s.Close()
+
+	// Should have at least a text event and a result event.
+	hasText := false
+	hasResult := false
+	for _, ev := range evts {
+		if ev.Type == core.EventText && ev.Content == "hi" {
+			hasText = true
+		}
+		if ev.Type == core.EventResult {
+			hasResult = true
+		}
+	}
+	if !hasText {
+		t.Error("missing text event")
+	}
+	if !hasResult {
+		t.Error("missing result event")
+	}
+	if s.CurrentSessionID() != "echo-sess" {
+		t.Errorf("sessionID = %q, want echo-sess", s.CurrentSessionID())
+	}
+}
+
+// ── loadModelsContextWindows ─────────────────────────────────
+
+func TestLoadModelsContextWindows(t *testing.T) {
+	savedEnv := os.Getenv("PI_CODING_AGENT_DIR")
+	t.Cleanup(func() {
+		if savedEnv != "" {
+			_ = os.Setenv("PI_CODING_AGENT_DIR", savedEnv)
+		} else {
+			_ = os.Unsetenv("PI_CODING_AGENT_DIR")
+		}
+	})
+
+	tmpDir := t.TempDir()
+	t.Setenv("PI_CODING_AGENT_DIR", tmpDir)
+
+	modelsJSON := map[string]any{
+		"providers": map[string]any{
+			"provider-a": map[string]any{
+				"models": []any{
+					map[string]any{"id": "model-alpha", "contextWindow": float64(128_000)},
+					map[string]any{"id": "model-beta", "contextWindow": float64(200_000)},
+				},
+			},
+			"provider-b": map[string]any{
+				"models": []any{
+					map[string]any{"id": "model-gamma", "contextWindow": float64(1_000_000)},
+				},
+			},
+		},
+	}
+	data, _ := json.Marshal(modelsJSON)
+	if err := os.WriteFile(filepath.Join(tmpDir, "models.json"), data, 0o644); err != nil {
+		t.Fatalf("write models.json: %v", err)
+	}
+
+	m := loadModelsContextWindows()
+	if m == nil {
+		t.Fatal("loadModelsContextWindows returned nil")
+	}
+
+	// Bare IDs.
+	if m["model-alpha"] != 128_000 {
+		t.Errorf("model-alpha = %d, want 128_000", m["model-alpha"])
+	}
+	if m["model-beta"] != 200_000 {
+		t.Errorf("model-beta = %d, want 200_000", m["model-beta"])
+	}
+	if m["model-gamma"] != 1_000_000 {
+		t.Errorf("model-gamma = %d, want 1_000_000", m["model-gamma"])
+	}
+
+	// Fully-qualified provider/ID.
+	if m["provider-a/model-alpha"] != 128_000 {
+		t.Errorf("provider-a/model-alpha = %d, want 128_000", m["provider-a/model-alpha"])
+	}
+	if m["provider-b/model-gamma"] != 1_000_000 {
+		t.Errorf("provider-b/model-gamma = %d, want 1_000_000", m["provider-b/model-gamma"])
+	}
+}
+
+func TestLoadModelsContextWindows_FileNotFound(t *testing.T) {
+	savedEnv := os.Getenv("PI_CODING_AGENT_DIR")
+	t.Cleanup(func() {
+		if savedEnv != "" {
+			_ = os.Setenv("PI_CODING_AGENT_DIR", savedEnv)
+		} else {
+			_ = os.Unsetenv("PI_CODING_AGENT_DIR")
+		}
+	})
+
+	tmpDir := t.TempDir()
+	t.Setenv("PI_CODING_AGENT_DIR", tmpDir)
+	// No models.json written.
+
+	m := loadModelsContextWindows()
+	if m != nil {
+		t.Errorf("expected nil for missing models.json, got %v", m)
+	}
+}
+
+func TestLoadModelsContextWindows_MalformedJSON(t *testing.T) {
+	savedEnv := os.Getenv("PI_CODING_AGENT_DIR")
+	t.Cleanup(func() {
+		if savedEnv != "" {
+			_ = os.Setenv("PI_CODING_AGENT_DIR", savedEnv)
+		} else {
+			_ = os.Unsetenv("PI_CODING_AGENT_DIR")
+		}
+	})
+
+	tmpDir := t.TempDir()
+	t.Setenv("PI_CODING_AGENT_DIR", tmpDir)
+	if err := os.WriteFile(filepath.Join(tmpDir, "models.json"), []byte("{invalid"), 0o644); err != nil {
+		t.Fatalf("write models.json: %v", err)
+	}
+
+	m := loadModelsContextWindows()
+	if m != nil {
+		t.Errorf("expected nil for malformed JSON, got %v", m)
+	}
+}
+
+// ── handleAgentEnd ───────────────────────────────────────────
+
+func TestHandleAgentEnd(t *testing.T) {
+	s := newTestSession()
+	defer s.cancel()
+	s.modelsCW = map[string]int{
+		"test-model":               200_000,
+		"test-provider/test-model": 200_000,
+	}
+
+	s.handleEvent(map[string]any{
+		"type": "agent_end",
+		"messages": []any{
+			map[string]any{
+				"role": "user",
+				"content": []any{
+					map[string]any{"type": "text", "text": "hello"},
+				},
+			},
+			map[string]any{
+				"role":  "assistant",
+				"model": "test-model",
+				"content": []any{
+					map[string]any{"type": "text", "text": "hi there"},
+				},
+				"usage": map[string]any{
+					"input":      float64(5000),
+					"output":     float64(300),
+					"cacheRead":  float64(40000),
+					"cacheWrite": float64(2000),
+				},
+			},
+		},
+	})
+
+	usage := s.GetContextUsage()
+	if usage == nil {
+		t.Fatal("GetContextUsage returned nil after agent_end with usage")
+	}
+
+	// UsedTokens = input + cacheWrite + cacheRead (mirrors claudecode pattern).
+	wantUsed := 5000 + 2000 + 40000 // 47000
+	if usage.UsedTokens != wantUsed {
+		t.Errorf("UsedTokens = %d, want %d", usage.UsedTokens, wantUsed)
+	}
+	// TotalTokens = UsedTokens + output.
+	wantTotal := wantUsed + 300 // 47300
+	if usage.TotalTokens != wantTotal {
+		t.Errorf("TotalTokens = %d, want %d", usage.TotalTokens, wantTotal)
+	}
+	if usage.InputTokens != 5000 {
+		t.Errorf("InputTokens = %d, want 5000", usage.InputTokens)
+	}
+	if usage.OutputTokens != 300 {
+		t.Errorf("OutputTokens = %d, want 300", usage.OutputTokens)
+	}
+	if usage.CachedInputTokens != 40000 {
+		t.Errorf("CachedInputTokens = %d, want 40000", usage.CachedInputTokens)
+	}
+	if usage.CacheCreationInputTokens != 2000 {
+		t.Errorf("CacheCreationInputTokens = %d, want 2000", usage.CacheCreationInputTokens)
+	}
+	if usage.ContextWindow != 200_000 {
+		t.Errorf("ContextWindow = %d, want 200_000", usage.ContextWindow)
+	}
+}
+
+func TestHandleAgentEnd_NoMessages(t *testing.T) {
+	s := newTestSession()
+	defer s.cancel()
+
+	s.handleEvent(map[string]any{
+		"type":     "agent_end",
+		"messages": []any{},
+	})
+
+	if s.GetContextUsage() != nil {
+		t.Error("GetContextUsage should be nil when agent_end has no messages")
+	}
+}
+
+func TestHandleAgentEnd_NoAssistantMessage(t *testing.T) {
+	s := newTestSession()
+	defer s.cancel()
+
+	s.handleEvent(map[string]any{
+		"type": "agent_end",
+		"messages": []any{
+			map[string]any{
+				"role": "user",
+				"content": []any{
+					map[string]any{"type": "text", "text": "hello"},
+				},
+			},
+		},
+	})
+
+	if s.GetContextUsage() != nil {
+		t.Error("GetContextUsage should be nil when no assistant message exists")
+	}
+}
+
+func TestHandleAgentEnd_NoUsage(t *testing.T) {
+	s := newTestSession()
+	defer s.cancel()
+
+	s.handleEvent(map[string]any{
+		"type": "agent_end",
+		"messages": []any{
+			map[string]any{
+				"role":  "assistant",
+				"model": "test-model",
+				"content": []any{
+					map[string]any{"type": "text", "text": "hi"},
+				},
+				// no "usage" key
+			},
+		},
+	})
+
+	if s.GetContextUsage() != nil {
+		t.Error("GetContextUsage should be nil when assistant message has no usage")
+	}
+}
+
+func TestHandleAgentEnd_FallbackContextWindow(t *testing.T) {
+	s := newTestSession()
+	defer s.cancel()
+	// Empty modelsCW (no entry for "unknown-model").
+	s.modelsCW = map[string]int{}
+
+	s.handleEvent(map[string]any{
+		"type": "agent_end",
+		"messages": []any{
+			map[string]any{
+				"role":  "assistant",
+				"model": "unknown-model",
+				"usage": map[string]any{
+					"input":      float64(1000),
+					"output":     float64(100),
+					"cacheRead":  float64(0),
+					"cacheWrite": float64(0),
+				},
+			},
+		},
+	})
+
+	usage := s.GetContextUsage()
+	if usage == nil {
+		t.Fatal("GetContextUsage returned nil")
+	}
+	if usage.ContextWindow != 200_000 {
+		t.Errorf("ContextWindow = %d, want 200_000 (fallback)", usage.ContextWindow)
+	}
+}
+
+func TestHandleAgentEnd_NilModelsCW(t *testing.T) {
+	s := newTestSession()
+	defer s.cancel()
+	// modelsCW is nil (not loaded).
+	s.modelsCW = nil
+
+	s.handleEvent(map[string]any{
+		"type": "agent_end",
+		"messages": []any{
+			map[string]any{
+				"role":  "assistant",
+				"model": "any-model",
+				"usage": map[string]any{
+					"input":      float64(500),
+					"output":     float64(50),
+					"cacheRead":  float64(0),
+					"cacheWrite": float64(0),
+				},
+			},
+		},
+	})
+
+	usage := s.GetContextUsage()
+	if usage == nil {
+		t.Fatal("GetContextUsage returned nil")
+	}
+	if usage.ContextWindow != 200_000 {
+		t.Errorf("ContextWindow = %d, want 200_000 (nil-map fallback)", usage.ContextWindow)
+	}
+}
+
+// ── GetContextUsage ──────────────────────────────────────────
+
+func TestGetContextUsage_NilBeforeAgentEnd(t *testing.T) {
+	s := newTestSession()
+	defer s.cancel()
+
+	if usage := s.GetContextUsage(); usage != nil {
+		t.Errorf("GetContextUsage should be nil before any agent_end, got %+v", usage)
+	}
+}
+
+func TestGetContextUsage_ReturnsCopy(t *testing.T) {
+	s := newTestSession()
+	defer s.cancel()
+	s.modelsCW = map[string]int{"m": 100_000}
+
+	s.handleEvent(map[string]any{
+		"type": "agent_end",
+		"messages": []any{
+			map[string]any{
+				"role":  "assistant",
+				"model": "m",
+				"usage": map[string]any{
+					"input":      float64(100),
+					"output":     float64(50),
+					"cacheRead":  float64(0),
+					"cacheWrite": float64(0),
+				},
+			},
+		},
+	})
+
+	u1 := s.GetContextUsage()
+	u2 := s.GetContextUsage()
+	if u1 == u2 {
+		t.Error("GetContextUsage should return different pointers (copy)")
+	}
+	if u1.UsedTokens != u2.UsedTokens {
+		t.Error("copies should have same values")
+	}
+}
+
+func TestHandleAgentEnd_WalksBackwardsForLastAssistant(t *testing.T) {
+	s := newTestSession()
+	defer s.cancel()
+	s.modelsCW = map[string]int{"model-a": 100_000, "model-b": 200_000}
+
+	// Two assistant messages — only the last one's usage should be captured.
+	s.handleEvent(map[string]any{
+		"type": "agent_end",
+		"messages": []any{
+			map[string]any{
+				"role":  "assistant",
+				"model": "model-a",
+				"usage": map[string]any{
+					"input":  float64(100),
+					"output": float64(10),
+				},
+			},
+			map[string]any{
+				"role":  "assistant",
+				"model": "model-b",
+				"usage": map[string]any{
+					"input":      float64(8000),
+					"output":     float64(500),
+					"cacheRead":  float64(3000),
+					"cacheWrite": float64(1000),
+				},
+			},
+		},
+	})
+
+	usage := s.GetContextUsage()
+	if usage == nil {
+		t.Fatal("GetContextUsage returned nil")
+	}
+	// Should use model-b (last assistant), not model-a.
+	if usage.ContextWindow != 200_000 {
+		t.Errorf("ContextWindow = %d, want 200_000 (from model-b)", usage.ContextWindow)
+	}
+	if usage.InputTokens != 8000 {
+		t.Errorf("InputTokens = %d, want 8000 (from model-b)", usage.InputTokens)
+	}
+	if usage.OutputTokens != 500 {
+		t.Errorf("OutputTokens = %d, want 500 (from model-b)", usage.OutputTokens)
+	}
+}
+
+func TestHandleAgentEnd_SkipsAssistantWithoutUsage(t *testing.T) {
+	s := newTestSession()
+	defer s.cancel()
+	s.modelsCW = map[string]int{"real-model": 500_000}
+
+	// First assistant has no usage, second has usage — walk backwards should
+	// skip the first and pick the second.
+	s.handleEvent(map[string]any{
+		"type": "agent_end",
+		"messages": []any{
+			map[string]any{
+				"role":  "assistant",
+				"model": "no-usage-model",
+				// no "usage"
+			},
+			map[string]any{
+				"role":  "assistant",
+				"model": "real-model",
+				"usage": map[string]any{
+					"input":      float64(3000),
+					"output":     float64(200),
+					"cacheRead":  float64(1000),
+					"cacheWrite": float64(500),
+				},
+			},
+		},
+	})
+
+	usage := s.GetContextUsage()
+	if usage == nil {
+		t.Fatal("GetContextUsage returned nil — should have found the second assistant")
+	}
+	if usage.ContextWindow != 500_000 {
+		t.Errorf("ContextWindow = %d, want 500_000", usage.ContextWindow)
+	}
+	if usage.InputTokens != 3000 {
+		t.Errorf("InputTokens = %d, want 3000", usage.InputTokens)
+	}
 }

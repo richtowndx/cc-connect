@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/chenhg5/cc-connect/core"
@@ -75,6 +76,73 @@ func TestParseSendArgs_UsesSessionEnvFallback(t *testing.T) {
 	}
 }
 
+func TestParseSendArgs_AudioAndVideoAttachments(t *testing.T) {
+	dir := t.TempDir()
+	audioPath := filepath.Join(dir, "voice.opus")
+	videoPath := filepath.Join(dir, "demo.mp4")
+	if err := os.WriteFile(audioPath, []byte("opus"), 0o644); err != nil {
+		t.Fatalf("write audio: %v", err)
+	}
+	if err := os.WriteFile(videoPath, []byte("mp4"), 0o644); err != nil {
+		t.Fatalf("write video: %v", err)
+	}
+
+	req, _, err := parseSendArgs([]string{"--audio", audioPath, "--video", videoPath})
+	if err != nil {
+		t.Fatalf("parseSendArgs returned error: %v", err)
+	}
+	if len(req.Images) != 0 {
+		t.Fatalf("images len = %d, want 0", len(req.Images))
+	}
+	if len(req.Files) != 2 {
+		t.Fatalf("files len = %d, want 2", len(req.Files))
+	}
+	if req.Files[0].FileName != "voice.opus" {
+		t.Fatalf("audio filename = %q, want voice.opus", req.Files[0].FileName)
+	}
+	if req.Files[1].FileName != "demo.mp4" {
+		t.Fatalf("video filename = %q, want demo.mp4", req.Files[1].FileName)
+	}
+}
+
+func TestParseSendArgs_TTSOnly(t *testing.T) {
+	t.Setenv("CC_PROJECT", "demo")
+	t.Setenv("CC_SESSION_KEY", "telegram:123:456")
+
+	req, _, err := parseSendArgs([]string{"--tts", "hello voice"})
+	if err != nil {
+		t.Fatalf("parseSendArgs returned error: %v", err)
+	}
+	if req.Project != "demo" {
+		t.Fatalf("project = %q, want demo", req.Project)
+	}
+	if req.SessionKey != "telegram:123:456" {
+		t.Fatalf("session = %q, want telegram:123:456", req.SessionKey)
+	}
+	if req.TTSText != "hello voice" {
+		t.Fatalf("tts text = %q", req.TTSText)
+	}
+	if req.Message != "" {
+		t.Fatalf("message = %q, want empty", req.Message)
+	}
+}
+
+func TestParseSendArgs_AudioRejectsNonAudio(t *testing.T) {
+	dir := t.TempDir()
+	docPath := filepath.Join(dir, "report.txt")
+	if err := os.WriteFile(docPath, []byte("hello"), 0o644); err != nil {
+		t.Fatalf("write doc: %v", err)
+	}
+
+	_, _, err := parseSendArgs([]string{"--audio", docPath})
+	if err == nil {
+		t.Fatal("expected non-audio attachment to be rejected")
+	}
+	if !strings.Contains(err.Error(), "not audio media") {
+		t.Fatalf("error = %q, want not audio media", err.Error())
+	}
+}
+
 func TestDetectAttachmentMimeType_UsesExtensionFallback(t *testing.T) {
 	mimeType := detectAttachmentMimeType("note.md", []byte("plain"))
 	if mimeType != "text/markdown; charset=utf-8" && mimeType != "text/markdown" {
@@ -137,6 +205,7 @@ func TestBuildSendPayload_JSONRoundTrip(t *testing.T) {
 		Project:    "demo",
 		SessionKey: "telegram:1:2",
 		Message:    "done",
+		TTSText:    "voice done",
 		Images: []core.ImageAttachment{{
 			MimeType: "image/png",
 			Data:     []byte("img"),
@@ -160,6 +229,9 @@ func TestBuildSendPayload_JSONRoundTrip(t *testing.T) {
 	}
 	if len(decoded.Images) != 1 || string(decoded.Images[0].Data) != "img" {
 		t.Fatalf("decoded images = %#v", decoded.Images)
+	}
+	if decoded.TTSText != "voice done" {
+		t.Fatalf("decoded tts_text = %q", decoded.TTSText)
 	}
 	if len(decoded.Files) != 1 || string(decoded.Files[0].Data) != "doc" {
 		t.Fatalf("decoded files = %#v", decoded.Files)

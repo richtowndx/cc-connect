@@ -33,6 +33,10 @@ const (
 	weixinSendRetryDelay = 500 * time.Millisecond
 	// weixinChunkSendDelay is the delay between sending message chunks to avoid rate limiting.
 	weixinChunkSendDelay = 100 * time.Millisecond
+	// typingTicketTTL is how long a cached typing ticket remains valid.
+	typingTicketTTL = 10 * time.Minute
+	// typingRepeatInterval is how often to resend the typing status to keep it alive.
+	typingRepeatInterval = 5 * time.Second
 )
 
 type replyContext struct {
@@ -61,6 +65,12 @@ type Platform struct {
 	cancel   context.CancelFunc
 	stopping bool
 
+	// lifecycleHandler receives readiness callbacks once the ilink long-poll
+	// actually confirms a working session (first successful getUpdates).
+	// This is what distinguishes ready-for-poll from a Start()-time
+	// ready-for-publish signal that does not yet mean "messages can flow".
+	lifecycleHandler core.PlatformLifecycleHandler
+
 	syncBufMu   sync.Mutex
 	syncBuf     string
 	syncBufPath string
@@ -74,6 +84,14 @@ type Platform struct {
 	tokensMu   sync.RWMutex
 	tokens     map[string]string
 	tokensPath string
+
+	typingMu      sync.RWMutex
+	typingTickets map[string]typingTicketEntry // peerUserID → cached ticket
+}
+
+type typingTicketEntry struct {
+	ticket    string
+	fetchedAt time.Time
 }
 
 func sanitizePathSegment(s string) string {
@@ -160,8 +178,9 @@ func New(opts map[string]any) (core.Platform, error) {
 		accountLabel:  accountLabel,
 		httpClient:    httpClient,
 		cdnHttpClient: cdnHttpClient,
-		tokens:       make(map[string]string),
-		dedup:        make(map[string]time.Time),
+		tokens:        make(map[string]string),
+		dedup:         make(map[string]time.Time),
+		typingTickets: make(map[string]typingTicketEntry),
 	}
 	p.api = newAPIClient(baseURL, token, routeTag, httpClient)
 
@@ -299,6 +318,17 @@ func (p *Platform) Start(handler core.MessageHandler) error {
 	return nil
 }
 
+// SetLifecycleHandler registers a handler that will be notified once the ilink
+// long-poll has confirmed a working session. Implements
+// core.AsyncRecoverablePlatform so the engine waits for the actual
+// ready-for-poll signal before logging "platform ready" and initialising
+// platform-level capabilities.
+func (p *Platform) SetLifecycleHandler(h core.PlatformLifecycleHandler) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.lifecycleHandler = h
+}
+
 func (p *Platform) Stop() error {
 	p.mu.Lock()
 	if p.cancel != nil {
@@ -313,6 +343,7 @@ func (p *Platform) Stop() error {
 func (p *Platform) pollLoop(ctx context.Context) {
 	backoff := time.Second
 	const maxBackoff = 30 * time.Second
+	readyNotified := false
 	for {
 		if ctx.Err() != nil {
 			return
@@ -356,11 +387,21 @@ func (p *Platform) pollLoop(ctx context.Context) {
 			slog.Warn("weixin: getUpdates ret", "ret", resp.Ret, "errcode", resp.Errcode, "errmsg", resp.Errmsg)
 		}
 
-		p.syncBufMu.Lock()
-		if resp.GetUpdatesBuf != "" {
-			p.persistSyncBuf(resp.GetUpdatesBuf)
+		// First successful getUpdates round-trip: ilink has accepted our token
+		// and the long-poll plumbing is alive. Treat this as the authoritative
+		// ready-for-poll signal; surface it to the engine so it can finish
+		// initialising platform-level capabilities and stop gating the
+		// "platform ready" log on a Start()-time promise.
+		if !readyNotified {
+			readyNotified = true
+			p.mu.RLock()
+			handler := p.lifecycleHandler
+			p.mu.RUnlock()
+			if handler != nil {
+				slog.Info("weixin: ilink ready-for-poll")
+				handler.OnPlatformReady(p)
+			}
 		}
-		p.syncBufMu.Unlock()
 
 		p.mu.RLock()
 		h := p.handler
@@ -368,8 +409,21 @@ func (p *Platform) pollLoop(ctx context.Context) {
 		if h == nil {
 			continue
 		}
+		var wg sync.WaitGroup
 		for i := range resp.Msgs {
-			p.dispatchInbound(ctx, &resp.Msgs[i], h)
+			i := i
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				p.dispatchInbound(ctx, &resp.Msgs[i], h)
+			}()
+		}
+		wg.Wait()
+
+		if ctx.Err() == nil && resp.GetUpdatesBuf != "" {
+			p.syncBufMu.Lock()
+			p.persistSyncBuf(resp.GetUpdatesBuf)
+			p.syncBufMu.Unlock()
 		}
 	}
 }
@@ -421,6 +475,7 @@ func (p *Platform) dispatchInbound(ctx context.Context, m *weixinMessage, h core
 
 	if tok := strings.TrimSpace(m.ContextToken); tok != "" {
 		p.setContextToken(from, tok)
+		p.refreshTypingTicket(ctx, from, tok)
 	}
 
 	body := bodyFromItemList(m.ItemList)
@@ -489,6 +544,101 @@ func (p *Platform) Send(ctx context.Context, replyCtx any, content string) error
 	return p.sendChunks(ctx, replyCtx, content)
 }
 
+// StartTyping sends a typing indicator to the peer and repeats every few seconds
+// until the returned stop function is called. Implements core.TypingIndicator.
+func (p *Platform) StartTyping(ctx context.Context, rctx any) (stop func()) {
+	rc, ok := rctx.(*replyContext)
+	if !ok || rc == nil {
+		return func() {}
+	}
+	peerID := rc.peerUserID
+	contextToken := rc.contextToken
+	if strings.TrimSpace(contextToken) == "" {
+		contextToken = p.getContextToken(peerID)
+	}
+
+	ticket := p.getTypingTicket(ctx, peerID, contextToken)
+	if ticket == "" {
+		return func() {}
+	}
+
+	if err := p.api.sendTyping(ctx, peerID, ticket, typingStatusStart); err != nil {
+		slog.Debug("weixin: initial typing start failed", "peer", peerID, "error", err)
+		return func() {}
+	}
+
+	done := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(typingRepeatInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-done:
+				// Best-effort stop; use background context since ctx may already be cancelled.
+				stopCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+				if err := p.api.sendTyping(stopCtx, peerID, ticket, typingStatusStop); err != nil {
+					slog.Debug("weixin: typing stop failed", "peer", peerID, "error", err)
+				}
+				cancel()
+				return
+			case <-ctx.Done():
+				stopCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+				if err := p.api.sendTyping(stopCtx, peerID, ticket, typingStatusStop); err != nil {
+					slog.Debug("weixin: typing stop failed (ctx cancelled)", "peer", peerID, "error", err)
+				}
+				cancel()
+				return
+			case <-ticker.C:
+				if err := p.api.sendTyping(ctx, peerID, ticket, typingStatusStart); err != nil {
+					slog.Debug("weixin: typing repeat failed", "peer", peerID, "error", err)
+					bestEffortCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+					_ = p.api.sendTyping(bestEffortCtx, peerID, ticket, typingStatusStop)
+					cancel()
+					return
+				}
+			}
+		}
+	}()
+
+	return func() { close(done) }
+}
+
+// getTypingTicket returns a cached typing ticket for the peer, fetching one
+// from the getconfig API if the cache is empty or expired.
+func (p *Platform) getTypingTicket(ctx context.Context, peerID, contextToken string) string {
+	p.typingMu.RLock()
+	entry, ok := p.typingTickets[peerID]
+	p.typingMu.RUnlock()
+	if ok && time.Since(entry.fetchedAt) < typingTicketTTL {
+		return entry.ticket
+	}
+
+	resp, err := p.api.getConfig(ctx, peerID, contextToken)
+	if err != nil {
+		slog.Debug("weixin: getConfig for typing ticket failed", "peer", peerID, "error", err)
+		return ""
+	}
+	ticket := strings.TrimSpace(resp.TypingTicket)
+	if ticket == "" {
+		return ""
+	}
+
+	p.typingMu.Lock()
+	p.typingTickets[peerID] = typingTicketEntry{ticket: ticket, fetchedAt: time.Now()}
+	p.typingMu.Unlock()
+	return ticket
+}
+
+// refreshTypingTicket proactively fetches and caches a typing ticket when a
+// message is received, so that StartTyping can use it without an extra round-trip.
+func (p *Platform) refreshTypingTicket(ctx context.Context, peerID, contextToken string) {
+	go func() {
+		fetchCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+		p.getTypingTicket(fetchCtx, peerID, contextToken)
+	}()
+}
+
 func (p *Platform) sendChunks(ctx context.Context, replyCtx any, content string) error {
 	rc, ok := replyCtx.(*replyContext)
 	if !ok || rc == nil {
@@ -498,12 +648,17 @@ func (p *Platform) sendChunks(ctx context.Context, replyCtx any, content string)
 		rc.contextToken = p.getContextToken(rc.peerUserID)
 	}
 	if strings.TrimSpace(rc.contextToken) == "" {
-		return fmt.Errorf("weixin: missing context_token for peer %q", rc.peerUserID)
+		slog.Error("weixin: cannot send message - missing context_token",
+			"peer", rc.peerUserID,
+			"content_preview", truncatePreview(content, 100),
+			"hint", "user needs to send a new message to refresh context_token")
+		return fmt.Errorf("weixin: missing context_token for peer %q - user must send a new message first", rc.peerUserID)
 	}
 	if strings.TrimSpace(content) == "" {
 		return nil
 	}
 	chunks := splitUTF8(content, maxWeixinChunk)
+	total := len(chunks)
 	for i, chunk := range chunks {
 		// Add delay between chunks to avoid rate limiting (except for first chunk)
 		if i > 0 {
@@ -514,17 +669,32 @@ func (p *Platform) sendChunks(ctx context.Context, replyCtx any, content string)
 			}
 		}
 		// Retry sendText with context_token refresh on failure
-		err := p.sendChunkWithRetry(ctx, rc, chunk)
+		err := p.sendChunkWithRetry(ctx, rc, chunk, i+1, total)
 		if err != nil {
-			return fmt.Errorf("weixin: send: %w", err)
+			slog.Error("weixin: chunk send failed, message incomplete",
+				"peer", rc.peerUserID,
+				"failed_chunk", fmt.Sprintf("%d/%d", i+1, total),
+				"error", err)
+			// Notify user that message delivery was incomplete.
+			// Use a short message that is unlikely to fail itself.
+			notice := "⚠️ 消息发送不完整，请在终端查看完整结果。"
+			noticeID := "cc-" + randomHex(6)
+			if nerr := p.api.sendText(ctx, rc.peerUserID, notice, rc.contextToken, noticeID); nerr != nil {
+				slog.Warn("weixin: failed to send incomplete-delivery notice", "peer", rc.peerUserID, "error", nerr)
+			}
+			return fmt.Errorf("weixin: send chunk %d/%d: %w", i+1, total, err)
 		}
 	}
 	return nil
 }
 
 // sendChunkWithRetry sends a single chunk with retry mechanism.
-// When sendMessage returns ret=-2, it retries with a fresh context_token.
-func (p *Platform) sendChunkWithRetry(ctx context.Context, rc *replyContext, chunk string) error {
+// When sendMessage returns ret=-2, it tries to refresh the context_token from
+// storage (which is updated by every inbound message) before retrying.
+// If the stored token is the same as the current one (no refresh possible),
+// it fails fast rather than burning retries on a stale token.
+// chunkIdx and totalChunks are 1-based indices used for logging context.
+func (p *Platform) sendChunkWithRetry(ctx context.Context, rc *replyContext, chunk string, chunkIdx, totalChunks int) error {
 	var lastErr error
 	for attempt := 0; attempt < weixinSendMaxRetries; attempt++ {
 		clientID := "cc-" + randomHex(6)
@@ -533,21 +703,40 @@ func (p *Platform) sendChunkWithRetry(ctx context.Context, rc *replyContext, chu
 			return nil
 		}
 		lastErr = err
-		// Check if error is ret=-2 (API declined) - retry with fresh token
+		// Check if error is ret=-2 (API declined) - attempt token refresh
 		if strings.Contains(err.Error(), "ret=-2") {
+			preview := []rune(chunk)
+			if len(preview) > 50 {
+				preview = preview[:50]
+			}
+			// Refresh context_token from stored tokens (may have been updated by a
+			// concurrent inbound message while we were waiting).
+			freshToken := p.getContextToken(rc.peerUserID)
+			if freshToken == "" || freshToken == rc.contextToken {
+				// No fresh token available — further retries would use the same stale
+				// token and all fail. Fail fast with an actionable error.
+				slog.Warn("weixin: sendMessage ret=-2, no fresh context_token available — "+
+					"user must send a new message to refresh the session token",
+					"attempt", attempt+1, "peer", rc.peerUserID,
+					"chunk", fmt.Sprintf("%d/%d", chunkIdx, totalChunks),
+					"chunk_runes", utf8.RuneCountInString(chunk),
+					"preview", string(preview))
+				return fmt.Errorf("weixin: sendMessage ret=-2 (expired context_token); "+
+					"user must send a new message to peer %q to refresh the session token: %w",
+					rc.peerUserID, lastErr)
+			}
 			slog.Warn("weixin: sendMessage ret=-2, retrying with fresh context_token",
-				"attempt", attempt+1, "peer", rc.peerUserID, "chunk_len", len(chunk))
-			// Add delay before retry
+				"attempt", attempt+1, "peer", rc.peerUserID,
+				"chunk", fmt.Sprintf("%d/%d", chunkIdx, totalChunks),
+				"chunk_runes", utf8.RuneCountInString(chunk),
+				"preview", string(preview))
+			rc.contextToken = freshToken
+			slog.Debug("weixin: using refreshed context_token for retry", "peer", rc.peerUserID)
+			// Brief delay before retry
 			select {
 			case <-ctx.Done():
 				return ctx.Err()
 			case <-time.After(weixinSendRetryDelay):
-			}
-			// Refresh context_token from stored tokens (may have been updated by new incoming message)
-			freshToken := p.getContextToken(rc.peerUserID)
-			if freshToken != "" && freshToken != rc.contextToken {
-				rc.contextToken = freshToken
-				slog.Debug("weixin: using refreshed context_token for retry", "peer", rc.peerUserID)
 			}
 			continue
 		}
@@ -555,6 +744,13 @@ func (p *Platform) sendChunkWithRetry(ctx context.Context, rc *replyContext, chu
 		return err
 	}
 	return lastErr
+}
+
+func truncatePreview(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	return s[:max] + "..."
 }
 
 func splitUTF8(s string, maxRunes int) []string {
@@ -598,4 +794,6 @@ var (
 	_ core.FormattingInstructionProvider = (*Platform)(nil)
 	_ core.ImageSender                   = (*Platform)(nil)
 	_ core.FileSender                    = (*Platform)(nil)
+	_ core.TypingIndicator               = (*Platform)(nil)
+	_ core.AsyncRecoverablePlatform      = (*Platform)(nil)
 )

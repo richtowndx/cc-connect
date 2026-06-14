@@ -33,12 +33,14 @@ type Agent struct {
 	model                string
 	mode                 string
 	cmd                  string // CLI binary name, default "opencode"
+	agentName            string // passed as --agent to opencode (for plugin-defined agents)
 	providers            []core.ProviderConfig
 	activeIdx            int
 	sessionEnv           []string
 	modelCachePath       string
 	persistentModelCache *opencodePersistentModelCache
 	refreshingModelCache bool
+	refreshWg            sync.WaitGroup // tracks in-flight background model-cache refresh goroutines
 	mu                   sync.RWMutex
 }
 
@@ -69,6 +71,7 @@ func New(opts map[string]any) (core.Agent, error) {
 	if cmd == "" {
 		cmd = "opencode"
 	}
+	agentName, _ := opts["agent"].(string) // --agent flag for plugin-defined agents (#1210)
 	ccDataDir, _ := opts["cc_data_dir"].(string)
 	ccProject, _ := opts["cc_project"].(string)
 	modelCachePath := opencodeProjectModelCachePath(ccDataDir, ccProject)
@@ -86,6 +89,7 @@ func New(opts map[string]any) (core.Agent, error) {
 		model:                model,
 		mode:                 mode,
 		cmd:                  cmd,
+		agentName:            agentName,
 		activeIdx:            -1,
 		modelCachePath:       modelCachePath,
 		persistentModelCache: persistentModelCache,
@@ -341,9 +345,11 @@ func (a *Agent) startPersistentModelRefresh(snapshot opencodeModelDiscoverySnaps
 		return
 	}
 	a.refreshingModelCache = true
+	a.refreshWg.Add(1)
 	a.mu.Unlock()
 
 	go func() {
+		defer a.refreshWg.Done()
 		defer func() {
 			a.mu.Lock()
 			a.refreshingModelCache = false
@@ -397,13 +403,6 @@ func (a *Agent) storePersistentModelCache(snapshot opencodeModelDiscoverySnapsho
 	a.persistentModelCache = cache
 	a.mu.Unlock()
 	return nil
-}
-
-// discoverModels runs `<cmd> models` and parses stdout line-by-line into a
-// normalized slice of ModelOption.
-// Returns nil if the command fails, times out, or produces no usable output.
-func (a *Agent) discoverModels(ctx context.Context) []core.ModelOption {
-	return a.discoverModelsWithSnapshot(ctx, a.modelDiscoverySnapshot())
 }
 
 func (a *Agent) discoverModelsWithSnapshot(ctx context.Context, snapshot opencodeModelDiscoverySnapshot) []core.ModelOption {
@@ -466,6 +465,7 @@ func (a *Agent) StartSession(ctx context.Context, sessionID string) (core.AgentS
 	mode := a.mode
 	cmd := a.cmd
 	workDir := a.workDir
+	agentName := a.agentName
 	extraEnv := a.providerEnvLocked()
 	extraEnv = append(extraEnv, a.sessionEnv...)
 	if a.activeIdx >= 0 && a.activeIdx < len(a.providers) {
@@ -475,12 +475,16 @@ func (a *Agent) StartSession(ctx context.Context, sessionID string) (core.AgentS
 	}
 	a.mu.Unlock()
 
-	return newOpencodeSession(ctx, cmd, workDir, model, mode, sessionID, extraEnv)
+	return newOpencodeSession(ctx, cmd, workDir, model, mode, agentName, sessionID, extraEnv)
 }
 
 // ListSessions runs `opencode session list` and parses the JSON output.
 func (a *Agent) ListSessions(_ context.Context) ([]core.AgentSessionInfo, error) {
-	return listOpencodeSessions(a.cmd, a.workDir)
+	a.mu.RLock()
+	cmd := a.cmd
+	workDir := a.workDir
+	a.mu.RUnlock()
+	return listOpencodeSessions(cmd, workDir)
 }
 
 func (a *Agent) Stop() error { return nil }
@@ -529,9 +533,12 @@ func (a *Agent) CompressCommand() string { return "/compact" }
 // -- MemoryFileProvider --
 
 func (a *Agent) ProjectMemoryFile() string {
-	absDir, err := filepath.Abs(a.workDir)
+	a.mu.RLock()
+	workDir := a.workDir
+	a.mu.RUnlock()
+	absDir, err := filepath.Abs(workDir)
 	if err != nil {
-		absDir = a.workDir
+		absDir = workDir
 	}
 	return filepath.Join(absDir, "OPENCODE.md")
 }
@@ -688,4 +695,30 @@ func opencodeDBPath() string {
 		return ""
 	}
 	return filepath.Join(home, ".local", "share", "opencode", "opencode.db")
+}
+
+func (a *Agent) GetSessionTitle(sessionID string) string {
+	return querySessionTitle(sessionID)
+}
+
+func querySessionTitle(sessionID string) string {
+	dbPath := opencodeDBPath()
+	if dbPath == "" {
+		return ""
+	}
+	if _, err := os.Stat(dbPath); err != nil {
+		return ""
+	}
+	sqlite3, err := exec.LookPath("sqlite3")
+	if err != nil {
+		return ""
+	}
+	escaped := strings.ReplaceAll(sessionID, "'", "''")
+	query := fmt.Sprintf("SELECT title FROM session WHERE id = '%s' LIMIT 1", escaped)
+	out, err := exec.Command(sqlite3, dbPath, query).Output()
+	if err != nil {
+		return ""
+	}
+	title := strings.TrimSpace(string(out))
+	return title
 }

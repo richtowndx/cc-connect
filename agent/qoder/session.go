@@ -23,17 +23,23 @@ import (
 // Each Send() spawns `qodercli -p <prompt> -f stream-json -q`.
 // Subsequent turns use `-r <sessionID>` to resume the conversation.
 type qoderSession struct {
-	workDir   string
-	model     string
-	mode      string
-	extraEnv  []string
-	events    chan core.Event
-	sessionID atomic.Value // stores string
-	ctx       context.Context
-	cancel    context.CancelFunc
-	wg        sync.WaitGroup
-	alive     atomic.Bool
+	workDir        string
+	model          string
+	mode           string
+	extraEnv       []string
+	events         chan core.Event
+	sessionID      atomic.Value // stores string
+	ctx            context.Context
+	cancel         context.CancelFunc
+	wg             sync.WaitGroup
+	alive          atomic.Bool
+	startupWarning string
 }
+
+// StartupWarning implements core.StartupWarner. Returns a non-empty string
+// when the session was started under degraded conditions (e.g. yolo mode
+// silently skipped under root).
+func (qs *qoderSession) StartupWarning() string { return qs.startupWarning }
 
 func newQoderSession(ctx context.Context, workDir, model, mode, resumeID string, extraEnv []string) (*qoderSession, error) {
 	sessionCtx, cancel := context.WithCancel(ctx)
@@ -48,6 +54,12 @@ func newQoderSession(ctx context.Context, workDir, model, mode, resumeID string,
 		cancel:   cancel,
 	}
 	qs.alive.Store(true)
+
+	// Detect root-induced yolo downgrade and surface it to the IM user via StartupWarning.
+	// The actual flag skip happens inside Send() when building the CLI args.
+	if mode == "yolo" && os.Geteuid() == 0 {
+		qs.startupWarning = "⚠️ Running as root: --dangerously-skip-permissions (yolo mode) is not supported and has been skipped. The agent may pause on high-risk operations."
+	}
 
 	if resumeID != "" && resumeID != core.ContinueSession {
 		qs.sessionID.Store(resumeID)
@@ -76,7 +88,11 @@ func (qs *qoderSession) Send(prompt string, images []core.ImageAttachment, files
 	}
 
 	if qs.mode == "yolo" {
-		args = append(args, "--dangerously-skip-permissions")
+		if os.Geteuid() == 0 {
+			slog.Warn("qoderSession: --dangerously-skip-permissions not allowed under root, skipping flag")
+		} else {
+			args = append(args, "--dangerously-skip-permissions")
+		}
 	}
 
 	if qs.model != "" {
@@ -206,13 +222,15 @@ type streamEvent struct {
 	SessionID string         `json:"session_id"`
 	Done      bool           `json:"done"`
 	Message   *streamMessage `json:"message"`
+	Result    string         `json:"result"` // qodercli 0.2.x: final text in top-level result field
 }
 
 type streamMessage struct {
-	ID      string          `json:"id"`
-	Role    string          `json:"role"`
-	Status  string          `json:"status"`
-	Content json.RawMessage `json:"content"`
+	ID         string          `json:"id"`
+	Role       string          `json:"role"`
+	Status     string          `json:"status"`
+	StopReason string          `json:"stop_reason"`
+	Content    json.RawMessage `json:"content"`
 }
 
 type contentItem struct {
@@ -249,8 +267,12 @@ func (qs *qoderSession) handleAssistant(ev *streamEvent) {
 		return
 	}
 
-	// Only process "finished" status to avoid duplicates from "tool_calling" status
-	if ev.Message.Status != "finished" {
+	// qodercli <0.2: uses Status="finished" to indicate final message
+	// qodercli 0.2.x: Status is empty/null, uses StopReason="end_turn"/"tool_use"
+	isFinished := ev.Message.Status == "finished" ||
+		ev.Message.StopReason == "end_turn" ||
+		ev.Message.StopReason == "tool_use"
+	if !isFinished {
 		return
 	}
 
@@ -285,6 +307,8 @@ func (qs *qoderSession) handleAssistant(ev *streamEvent) {
 
 func (qs *qoderSession) handleResult(ev *streamEvent) {
 	var finalText string
+
+	// qodercli <0.2: result text is in message.content[].text
 	if ev.Message != nil {
 		var items []contentItem
 		if err := json.Unmarshal(ev.Message.Content, &items); err == nil {
@@ -294,6 +318,11 @@ func (qs *qoderSession) handleResult(ev *streamEvent) {
 				}
 			}
 		}
+	}
+
+	// qodercli 0.2.x: result text is in top-level "result" field
+	if finalText == "" && ev.Result != "" {
+		finalText = ev.Result
 	}
 
 	evt := core.Event{Type: core.EventResult, Content: finalText, SessionID: qs.CurrentSessionID(), Done: true}
@@ -331,10 +360,10 @@ func (qs *qoderSession) Close() error {
 	}()
 	select {
 	case <-done:
+		close(qs.events)
 	case <-time.After(8 * time.Second):
 		slog.Warn("qoderSession: close timed out, abandoning wg.Wait")
 	}
-	close(qs.events)
 	return nil
 }
 

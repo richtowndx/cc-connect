@@ -1,6 +1,9 @@
 package core
 
-import "fmt"
+import (
+	"fmt"
+	"sync"
+)
 
 // Language represents a supported language
 type Language string
@@ -14,8 +17,15 @@ const (
 	LangSpanish            Language = "es"
 )
 
-// I18n provides internationalized messages
+// I18n provides internationalized messages.
+//
+// All exported methods are safe to call from multiple goroutines: cc-connect
+// fans out platform message handlers concurrently, all of which can call
+// DetectAndSet (writes `detected`) and T / CurrentLang (read `lang`/`detected`)
+// at the same time. Without the mutex `go test -race` flags real data races
+// on the language fields.
 type I18n struct {
+	mu       sync.RWMutex
 	lang     Language
 	detected Language
 	saveFunc func(Language) error
@@ -26,6 +36,8 @@ func NewI18n(lang Language) *I18n {
 }
 
 func (i *I18n) SetSaveFunc(fn func(Language) error) {
+	i.mu.Lock()
+	defer i.mu.Unlock()
 	i.saveFunc = fn
 }
 
@@ -76,21 +88,41 @@ func isSpanishHint(text string) bool {
 }
 
 func (i *I18n) DetectAndSet(text string) {
+	i.mu.RLock()
 	if i.lang != LangAuto {
+		i.mu.RUnlock()
 		return
 	}
+	currentDetected := i.detected
+	i.mu.RUnlock()
+
 	detected := DetectLanguage(text)
-	if i.detected != detected {
-		i.detected = detected
-		if i.saveFunc != nil {
-			if err := i.saveFunc(detected); err != nil {
-				fmt.Printf("failed to save language: %v\n", err)
-			}
+	if currentDetected == detected {
+		return
+	}
+
+	i.mu.Lock()
+	// Re-check under the write lock — another goroutine may have updated
+	// i.detected between our RUnlock above and the Lock here.
+	if i.lang != LangAuto || i.detected == detected {
+		i.mu.Unlock()
+		return
+	}
+	i.detected = detected
+	saveFunc := i.saveFunc
+	i.mu.Unlock()
+
+	if saveFunc != nil {
+		if err := saveFunc(detected); err != nil {
+			fmt.Printf("failed to save language: %v\n", err)
 		}
 	}
 }
 
 func (i *I18n) currentLang() Language {
+	// Caller holds either no lock (most public methods take RLock and call
+	// this) or RLock; this helper just reads the protected fields. All
+	// public methods that call currentLang() acquire i.mu.RLock first.
 	if i.lang == LangAuto {
 		if i.detected != "" {
 			return i.detected
@@ -101,16 +133,24 @@ func (i *I18n) currentLang() Language {
 }
 
 // CurrentLang returns the resolved language (exported for mode display).
-func (i *I18n) CurrentLang() Language { return i.currentLang() }
+func (i *I18n) CurrentLang() Language {
+	i.mu.RLock()
+	defer i.mu.RUnlock()
+	return i.currentLang()
+}
 
 // IsZhLike returns true for Simplified and Traditional Chinese.
 func (i *I18n) IsZhLike() bool {
+	i.mu.RLock()
+	defer i.mu.RUnlock()
 	l := i.currentLang()
 	return l == LangChinese || l == LangTraditionalChinese
 }
 
 // SetLang overrides the language (disabling auto-detect).
 func (i *I18n) SetLang(lang Language) {
+	i.mu.Lock()
+	defer i.mu.Unlock()
 	i.lang = lang
 	i.detected = ""
 }
@@ -129,8 +169,10 @@ const (
 	MsgToolResultFmtOk           MsgKey = "tool_result_fmt_ok"
 	MsgToolResultFmtFailed       MsgKey = "tool_result_fmt_failed"
 	MsgExecutionStopped          MsgKey = "execution_stopped"
+	MsgSessionCancelled          MsgKey = "session_cancelled"
 	MsgNoExecution               MsgKey = "no_execution"
 	MsgPreviousProcessing        MsgKey = "previous_processing"
+	MsgQueueFull                 MsgKey = "queue_full"
 	MsgMessageQueued             MsgKey = "message_queued"
 	MsgNoToolsAllowed            MsgKey = "no_tools_allowed"
 	MsgCurrentTools              MsgKey = "current_tools"
@@ -139,6 +181,7 @@ const (
 	MsgToolAllowFailed           MsgKey = "tool_allow_failed"
 	MsgToolAllowedNew            MsgKey = "tool_allowed_new"
 	MsgError                     MsgKey = "error"
+	MsgSessionNotFound           MsgKey = "session_not_found"
 	MsgFailedToStartAgentSession MsgKey = "failed_to_start_agent_session"
 	MsgFailedToDeleteSession     MsgKey = "failed_to_delete_session"
 	MsgEmptyResponse             MsgKey = "empty_response"
@@ -149,16 +192,19 @@ const (
 	MsgPermissionHint            MsgKey = "permission_hint"
 	MsgQuietOn                   MsgKey = "quiet_on"
 	MsgQuietOff                  MsgKey = "quiet_off"
+	MsgDisplayModeCompact        MsgKey = "display_mode_compact"
 	MsgQuietGlobalOn             MsgKey = "quiet_global_on"
 	MsgQuietGlobalOff            MsgKey = "quiet_global_off"
 	MsgModeChanged               MsgKey = "mode_changed"
 	MsgModeNotSupported          MsgKey = "mode_not_supported"
 	MsgSessionRestarting         MsgKey = "session_restarting"
 	MsgSessionNotStarted         MsgKey = "session_not_started"
+	MsgUntitled                  MsgKey = "untitled"
 	MsgLangChanged               MsgKey = "lang_changed"
 	MsgLangInvalid               MsgKey = "lang_invalid"
 	MsgLangCurrent               MsgKey = "lang_current"
 	MsgUnknownCommand            MsgKey = "unknown_command"
+	MsgWelcome                   MsgKey = "welcome"
 	MsgHelp                      MsgKey = "message_help" // change from "help", which is used now for builtin command help
 	MsgHelpTitle                 MsgKey = "help_title"
 	MsgHelpSessionSection        MsgKey = "help_session_section"
@@ -191,6 +237,13 @@ const (
 	MsgProviderAddFailed         MsgKey = "provider_add_failed"
 	MsgProviderRemoved           MsgKey = "provider_removed"
 	MsgProviderRemoveFailed      MsgKey = "provider_remove_failed"
+	MsgCardTitleProviderAdd      MsgKey = "card_title_provider_add"
+	MsgProviderAddPickHint       MsgKey = "provider_add_pick_hint"
+	MsgProviderAddOther          MsgKey = "provider_add_other"
+	MsgProviderAddApiKeyPrompt   MsgKey = "provider_add_api_key_prompt"
+	MsgProviderAddInviteHint     MsgKey = "provider_add_invite_hint"
+	MsgProviderLinkGlobal        MsgKey = "provider_link_global"
+	MsgProviderLinked            MsgKey = "provider_linked"
 
 	MsgVoiceNotEnabled               MsgKey = "voice_not_enabled"
 	MsgVoiceUsingPlatformRecognition MsgKey = "voice_using_platform_recognition"
@@ -214,36 +267,42 @@ const (
 	MsgHeartbeatUsage        MsgKey = "heartbeat_usage"
 	MsgHeartbeatInvalidMins  MsgKey = "heartbeat_invalid_mins"
 
-	MsgCronNotAvailable MsgKey = "cron_not_available"
-	MsgCronUsage        MsgKey = "cron_usage"
-	MsgCronAddUsage     MsgKey = "cron_add_usage"
-	MsgCronAdded        MsgKey = "cron_added"
-	MsgCronAddedExec    MsgKey = "cron_added_exec"
-	MsgCronAddExecUsage MsgKey = "cron_addexec_usage"
-	MsgCronEmpty        MsgKey = "cron_empty"
-	MsgCronListTitle    MsgKey = "cron_list_title"
-	MsgCronListFooter   MsgKey = "cron_list_footer"
-	MsgCronDelUsage     MsgKey = "cron_del_usage"
-	MsgCronDeleted      MsgKey = "cron_deleted"
-	MsgCronNotFound     MsgKey = "cron_not_found"
-	MsgCronEnabled      MsgKey = "cron_enabled"
-	MsgCronDisabled     MsgKey = "cron_disabled"
-	MsgCronMuted        MsgKey = "cron_muted"
-	MsgCronUnmuted      MsgKey = "cron_unmuted"
-	MsgCronCardHint     MsgKey = "cron_card_hint"
-	MsgCronNextShort    MsgKey = "cron_next_short"
-	MsgCronLastShort    MsgKey = "cron_last_short"
-	MsgCronBtnEnable    MsgKey = "cron_btn_enable"
-	MsgCronBtnDisable   MsgKey = "cron_btn_disable"
-	MsgCronBtnMute      MsgKey = "cron_btn_mute"
-	MsgCronBtnUnmute    MsgKey = "cron_btn_unmute"
-	MsgCronBtnDelete    MsgKey = "cron_btn_delete"
+	MsgCronNotAvailable       MsgKey = "cron_not_available"
+	MsgCronUsage              MsgKey = "cron_usage"
+	MsgCronAddUsage           MsgKey = "cron_add_usage"
+	MsgCronAdded              MsgKey = "cron_added"
+	MsgCronAddedExec          MsgKey = "cron_added_exec"
+	MsgCronAddExecUsage       MsgKey = "cron_addexec_usage"
+	MsgCronEmpty              MsgKey = "cron_empty"
+	MsgCronListTitle          MsgKey = "cron_list_title"
+	MsgCronListFooter         MsgKey = "cron_list_footer"
+	MsgCronExecUsage          MsgKey = "cron_exec_usage"
+	MsgCronTriggered          MsgKey = "cron_triggered"
+	MsgCronProjectUnavailable MsgKey = "cron_project_unavailable"
+	MsgCronDelUsage           MsgKey = "cron_del_usage"
+	MsgCronDeleted            MsgKey = "cron_deleted"
+	MsgCronNotFound           MsgKey = "cron_not_found"
+	MsgCronEnabled            MsgKey = "cron_enabled"
+	MsgCronDisabled           MsgKey = "cron_disabled"
+	MsgCronMuted              MsgKey = "cron_muted"
+	MsgCronUnmuted            MsgKey = "cron_unmuted"
+	MsgCronCardHint           MsgKey = "cron_card_hint"
+	MsgCronNextShort          MsgKey = "cron_next_short"
+	MsgCronLastShort          MsgKey = "cron_last_short"
+	MsgCronBtnEnable          MsgKey = "cron_btn_enable"
+	MsgCronBtnDisable         MsgKey = "cron_btn_disable"
+	MsgCronBtnMute            MsgKey = "cron_btn_mute"
+	MsgCronBtnUnmute          MsgKey = "cron_btn_unmute"
+	MsgCronBtnDelete          MsgKey = "cron_btn_delete"
 
-	MsgStatusTitle MsgKey = "status_title"
-
+	MsgStatusTitle           MsgKey = "status_title"
+	MsgReplyFooterRemaining  MsgKey = "reply_footer_remaining"
 	MsgModelCurrent          MsgKey = "model_current"
 	MsgModelChanged          MsgKey = "model_changed"
 	MsgModelChangeFailed     MsgKey = "model_change_failed"
+	MsgModelCardSwitching    MsgKey = "model_card_switching"
+	MsgModelCardSwitched     MsgKey = "model_card_switched"
+	MsgModelCardSwitchFailed MsgKey = "model_card_switch_failed"
 	MsgModelNotSupported     MsgKey = "model_not_supported"
 	MsgReasoningCurrent      MsgKey = "reasoning_current"
 	MsgReasoningChanged      MsgKey = "reasoning_changed"
@@ -271,6 +330,7 @@ const (
 	MsgStatusThinkingMessages MsgKey = "status_thinking_messages"
 	MsgStatusToolMessages     MsgKey = "status_tool_messages"
 	MsgStatusSessionKey       MsgKey = "status_session_key"
+	MsgStatusAgentSID         MsgKey = "status_agent_sid"
 	MsgStatusUserID           MsgKey = "status_user_id"
 	MsgEnabledShort           MsgKey = "enabled_short"
 	MsgDisabledShort          MsgKey = "disabled_short"
@@ -288,6 +348,7 @@ const (
 	MsgModelSelectPlaceholder    MsgKey = "model_select_placeholder"
 	MsgModeSelectPlaceholder     MsgKey = "mode_select_placeholder"
 	MsgProviderSelectPlaceholder MsgKey = "provider_select_placeholder"
+	MsgProviderClearOption       MsgKey = "provider_clear_option"
 	MsgCardBack                  MsgKey = "card_back"
 	MsgCardPrev                  MsgKey = "card_prev"
 	MsgCardNext                  MsgKey = "card_next"
@@ -303,6 +364,7 @@ const (
 	MsgCardTitleHistoryLast      MsgKey = "card_title_history_last"
 	MsgCardTitleProvider         MsgKey = "card_title_provider"
 	MsgCardTitleCron             MsgKey = "card_title_cron"
+	MsgCardTitleTimer            MsgKey = "card_title_timer"
 	MsgCardTitleHeartbeat        MsgKey = "card_title_heartbeat"
 	MsgCardTitleCommands         MsgKey = "card_title_commands"
 	MsgCardTitleAlias            MsgKey = "card_title_alias"
@@ -315,6 +377,29 @@ const (
 	MsgListEmptySummary          MsgKey = "list_empty_summary"
 	MsgCronIDLabel               MsgKey = "cron_id_label"
 	MsgCronFailedSuffix          MsgKey = "cron_failed_suffix"
+
+	MsgTimerNotAvailable  MsgKey = "timer_not_available"
+	MsgTimerUsage         MsgKey = "timer_usage"
+	MsgTimerAddUsage      MsgKey = "timer_add_usage"
+	MsgTimerAdded         MsgKey = "timer_added"
+	MsgTimerAddedExec     MsgKey = "timer_added_exec"
+	MsgTimerAddExecUsage  MsgKey = "timer_addexec_usage"
+	MsgTimerEmpty         MsgKey = "timer_empty"
+	MsgTimerListTitle     MsgKey = "timer_list_title"
+	MsgTimerListFooter    MsgKey = "timer_list_footer"
+	MsgTimerDelUsage      MsgKey = "timer_del_usage"
+	MsgTimerMuteUsage     MsgKey = "timer_mute_usage"
+	MsgTimerDeleted       MsgKey = "timer_deleted"
+	MsgTimerNotFound      MsgKey = "timer_not_found"
+	MsgTimerMuted         MsgKey = "timer_muted"
+	MsgTimerUnmuted       MsgKey = "timer_unmuted"
+	MsgTimerCardHint      MsgKey = "timer_card_hint"
+	MsgTimerBtnMute       MsgKey = "timer_btn_mute"
+	MsgTimerBtnUnmute     MsgKey = "timer_btn_unmute"
+	MsgTimerBtnDelete     MsgKey = "timer_btn_delete"
+	MsgTimerIDLabel       MsgKey = "timer_id_label"
+	MsgTimerScheduledLabel MsgKey = "timer_scheduled_label"
+	MsgTimerFailedSuffix  MsgKey = "timer_failed_suffix"
 	MsgCommandsTagAgent          MsgKey = "commands_tag_agent"
 	MsgCommandsTagShell          MsgKey = "commands_tag_shell"
 	MsgUpgradeTimeoutSuffix      MsgKey = "upgrade_timeout_suffix"
@@ -330,11 +415,12 @@ const (
 	MsgPermCardBody    MsgKey = "perm_card_body"
 	MsgPermCardNote    MsgKey = "perm_card_note"
 
-	MsgAskQuestionTitle    MsgKey = "ask_question_title"
-	MsgAskQuestionNote     MsgKey = "ask_question_note"
-	MsgAskQuestionMulti    MsgKey = "ask_question_multi"
-	MsgAskQuestionPrompt   MsgKey = "ask_question_prompt"
-	MsgAskQuestionAnswered MsgKey = "ask_question_answered"
+	MsgAskQuestionTitle     MsgKey = "ask_question_title"
+	MsgAskQuestionNote      MsgKey = "ask_question_note"
+	MsgAskQuestionNoteMulti MsgKey = "ask_question_note_multi"
+	MsgAskQuestionMulti     MsgKey = "ask_question_multi"
+	MsgAskQuestionPrompt    MsgKey = "ask_question_prompt"
+	MsgAskQuestionAnswered  MsgKey = "ask_question_answered"
 
 	MsgCommandsTitle        MsgKey = "commands_title"
 	MsgCommandsEmpty        MsgKey = "commands_empty"
@@ -353,9 +439,10 @@ const (
 	MsgCommandExecError   MsgKey = "command_exec_error"
 	MsgCommandExecSuccess MsgKey = "command_exec_success"
 
-	MsgSkillsTitle MsgKey = "skills_title"
-	MsgSkillsEmpty MsgKey = "skills_empty"
-	MsgSkillsHint  MsgKey = "skills_hint"
+	MsgSkillsTitle            MsgKey = "skills_title"
+	MsgSkillsEmpty            MsgKey = "skills_empty"
+	MsgSkillsHint             MsgKey = "skills_hint"
+	MsgSkillsTelegramMenuHint MsgKey = "skills_telegram_menu_hint"
 
 	MsgConfigTitle       MsgKey = "config_title"
 	MsgConfigHint        MsgKey = "config_hint"
@@ -392,10 +479,10 @@ const (
 	MsgAliasNotFound   MsgKey = "alias_not_found"
 	MsgAliasUsage      MsgKey = "alias_usage"
 
-	MsgNewSessionCreated     MsgKey = "new_session_created"
-	MsgNewSessionCreatedName MsgKey = "new_session_created_name"
-	MsgSessionAutoResetIdle     MsgKey = "session_auto_reset_idle"
-	MsgSessionClosingGraceful   MsgKey = "session_closing_graceful"
+	MsgNewSessionCreated      MsgKey = "new_session_created"
+	MsgNewSessionCreatedName  MsgKey = "new_session_created_name"
+	MsgSessionAutoResetIdle   MsgKey = "session_auto_reset_idle"
+	MsgSessionClosingGraceful MsgKey = "session_closing_graceful"
 
 	MsgDeleteUsage              MsgKey = "delete_usage"
 	MsgDeleteSuccess            MsgKey = "delete_success"
@@ -412,6 +499,8 @@ const (
 	MsgDeleteModeBackButton     MsgKey = "delete_mode_back_button"
 	MsgDeleteModeEmptySelection MsgKey = "delete_mode_empty_selection"
 	MsgDeleteModeResultTitle    MsgKey = "delete_mode_result_title"
+	MsgDeleteModeDeletingTitle  MsgKey = "delete_mode_deleting_title"
+	MsgDeleteModeDeletingBody   MsgKey = "delete_mode_deleting_body"
 	MsgDeleteModeMissingSession MsgKey = "delete_mode_missing_session"
 
 	MsgSwitchSuccess   MsgKey = "switch_success"
@@ -424,8 +513,10 @@ const (
 	MsgCommandDisabled   MsgKey = "command_disabled"
 	MsgAdminRequired     MsgKey = "admin_required"
 	MsgRateLimited       MsgKey = "rate_limited"
-	MsgBtwSent           MsgKey = "btw_sent"
-	MsgBtwSendFailed     MsgKey = "btw_send_failed"
+	MsgPsSent            MsgKey = "ps_sent"
+	MsgPsSendFailed      MsgKey = "ps_send_failed"
+	MsgPsEmpty           MsgKey = "ps_empty"
+	MsgPsNoSession       MsgKey = "ps_no_session"
 
 	MsgWhoamiTitle     MsgKey = "whoami_title"
 	MsgWhoamiCardTitle MsgKey = "whoami_card_title"
@@ -491,9 +582,10 @@ const (
 	MsgBuiltinCmdShell     MsgKey = "shell"
 	MsgBuiltinCmdDir       MsgKey = "dir"
 	MsgBuiltinCmdDiff      MsgKey = "diff"
+	MsgBuiltinCmdPs        MsgKey = "ps"
 
-	MsgDiffEmpty           MsgKey = "diff_empty"
-	MsgDiffNoDiff2HTML     MsgKey = "diff_no_diff2html"
+	MsgDiffEmpty       MsgKey = "diff_empty"
+	MsgDiffNoDiff2HTML MsgKey = "diff_no_diff2html"
 
 	MsgDirChanged          MsgKey = "dir_changed"
 	MsgDirCurrent          MsgKey = "dir_current"
@@ -519,36 +611,41 @@ const (
 	MsgShowReadFailed      MsgKey = "show_read_failed"
 
 	// Multi-workspace messages
-	MsgWsNotEnabled            MsgKey = "ws_not_enabled"
-	MsgWsNoBinding             MsgKey = "ws_no_binding"
-	MsgWsInfo                  MsgKey = "ws_info"
-	MsgWsInfoShared            MsgKey = "ws_info_shared"
-	MsgWsUsage                 MsgKey = "ws_usage"
-	MsgWsInitUsage             MsgKey = "ws_init_usage"
-	MsgWsBindUsage             MsgKey = "ws_bind_usage"
-	MsgWsBindSuccess           MsgKey = "ws_bind_success"
-	MsgWsBindNotFound          MsgKey = "ws_bind_not_found"
-	MsgWsRouteUsage            MsgKey = "ws_route_usage"
-	MsgWsRouteSuccess          MsgKey = "ws_route_success"
-	MsgWsRouteAbsoluteRequired MsgKey = "ws_route_absolute_required"
-	MsgWsRouteNotFound         MsgKey = "ws_route_not_found"
-	MsgWsRouteNotDirectory     MsgKey = "ws_route_not_directory"
-	MsgWsUnbindSuccess         MsgKey = "ws_unbind_success"
-	MsgWsListEmpty             MsgKey = "ws_list_empty"
-	MsgWsListTitle             MsgKey = "ws_list_title"
-	MsgWsSharedNoBinding       MsgKey = "ws_shared_no_binding"
-	MsgWsSharedUsage           MsgKey = "ws_shared_usage"
-	MsgWsSharedBindSuccess     MsgKey = "ws_shared_bind_success"
-	MsgWsSharedRouteSuccess    MsgKey = "ws_shared_route_success"
-	MsgWsSharedUnbindSuccess   MsgKey = "ws_shared_unbind_success"
-	MsgWsSharedListEmpty       MsgKey = "ws_shared_list_empty"
-	MsgWsSharedListTitle       MsgKey = "ws_shared_list_title"
-	MsgWsSharedOnlyHint        MsgKey = "ws_shared_only_hint"
-	MsgWsNotFoundHint          MsgKey = "ws_not_found_hint"
-	MsgWsResolutionError       MsgKey = "ws_resolution_error"
-	MsgWsCloneProgress         MsgKey = "ws_clone_progress"
-	MsgWsCloneSuccess          MsgKey = "ws_clone_success"
-	MsgWsCloneFailed           MsgKey = "ws_clone_failed"
+	MsgWsNotEnabled             MsgKey = "ws_not_enabled"
+	MsgWsNoBinding              MsgKey = "ws_no_binding"
+	MsgWsInfo                   MsgKey = "ws_info"
+	MsgWsInfoShared             MsgKey = "ws_info_shared"
+	MsgWsUsage                  MsgKey = "ws_usage"
+	MsgWsInitUsage              MsgKey = "ws_init_usage"
+	MsgWsBindUsage              MsgKey = "ws_bind_usage"
+	MsgWsBindSuccess            MsgKey = "ws_bind_success"
+	MsgWsBindNotFound           MsgKey = "ws_bind_not_found"
+	MsgWsRouteUsage             MsgKey = "ws_route_usage"
+	MsgWsRouteSuccess           MsgKey = "ws_route_success"
+	MsgWsRouteAbsoluteRequired  MsgKey = "ws_route_absolute_required"
+	MsgWsRouteNotFound          MsgKey = "ws_route_not_found"
+	MsgWsRouteNotDirectory      MsgKey = "ws_route_not_directory"
+	MsgWsUnbindSuccess          MsgKey = "ws_unbind_success"
+	MsgWsListEmpty              MsgKey = "ws_list_empty"
+	MsgWsListTitle              MsgKey = "ws_list_title"
+	MsgWsSharedNoBinding        MsgKey = "ws_shared_no_binding"
+	MsgWsSharedUsage            MsgKey = "ws_shared_usage"
+	MsgWsSharedBindSuccess      MsgKey = "ws_shared_bind_success"
+	MsgWsSharedRouteSuccess     MsgKey = "ws_shared_route_success"
+	MsgWsSharedUnbindSuccess    MsgKey = "ws_shared_unbind_success"
+	MsgWsSharedListEmpty        MsgKey = "ws_shared_list_empty"
+	MsgWsSharedListTitle        MsgKey = "ws_shared_list_title"
+	MsgWsSharedOnlyHint         MsgKey = "ws_shared_only_hint"
+	MsgWsNotFoundHint           MsgKey = "ws_not_found_hint"
+	MsgWsNotFoundHintGitOnly    MsgKey = "ws_not_found_hint_git_only"
+	MsgWsResolutionError        MsgKey = "ws_resolution_error"
+	MsgWsCloneProgress          MsgKey = "ws_clone_progress"
+	MsgWsCloneSuccess           MsgKey = "ws_clone_success"
+	MsgWsCloneFailed            MsgKey = "ws_clone_failed"
+	MsgWsInitDirNotFound        MsgKey = "ws_init_dir_not_found"
+	MsgWsInitInvalidTarget      MsgKey = "ws_init_invalid_target"
+	MsgWsInitLocalPathsDisabled MsgKey = "ws_init_local_paths_disabled"
+	MsgBackgroundAutoDenied     MsgKey = "background_auto_denied"
 )
 
 var messages = map[MsgKey]map[Language]string{
@@ -619,6 +716,13 @@ var messages = map[MsgKey]map[Language]string{
 		LangJapanese:           "⏹ 実行を停止しました。",
 		LangSpanish:            "⏹ Ejecución detenida.",
 	},
+	MsgSessionCancelled: {
+		LangEnglish:            "Session cancelled. Ready for new instructions.",
+		LangChinese:            "会话已取消。可以继续新的对话。",
+		LangTraditionalChinese: "會話已取消。可以繼續新的對話。",
+		LangJapanese:           "セッションをキャンセルしました。新しい指示を受け付けます。",
+		LangSpanish:            "Sesion cancelada. Listo para nuevas instrucciones.",
+	},
 	MsgNoExecution: {
 		LangEnglish:            "No execution in progress.",
 		LangChinese:            "没有正在执行的任务。",
@@ -627,11 +731,11 @@ var messages = map[MsgKey]map[Language]string{
 		LangSpanish:            "No hay ejecución en progreso.",
 	},
 	MsgPreviousProcessing: {
-		LangEnglish:            "⏳ Previous request still processing. Use `/btw <message>` to add context to the current turn.",
-		LangChinese:            "⏳ 上一个请求仍在处理中。使用 `/btw <消息>` 可向当前轮次追加上下文。",
-		LangTraditionalChinese: "⏳ 上一個請求仍在處理中。使用 `/btw <訊息>` 可向當前輪次追加上下文。",
-		LangJapanese:           "⏳ 前のリクエストを処理中です。`/btw <メッセージ>` で現在のターンにコンテキストを追加できます。",
-		LangSpanish:            "⏳ La solicitud anterior aún se está procesando. Use `/btw <mensaje>` para agregar contexto al turno actual.",
+		LangEnglish:            "⏳ Previous request still processing. Use `/ps <message>` to send a P.S. to the running task.",
+		LangChinese:            "⏳ 上一个请求仍在处理中。使用 `/ps <消息>` 可向正在执行的任务追加补充信息。",
+		LangTraditionalChinese: "⏳ 上一個請求仍在處理中。使用 `/ps <訊息>` 可向正在執行的任務追加補充資訊。",
+		LangJapanese:           "⏳ 前のリクエストを処理中です。`/ps <メッセージ>` で実行中のタスクに補足情報を送れます。",
+		LangSpanish:            "⏳ La solicitud anterior aún se está procesando. Use `/ps <mensaje>` para enviar un P.S. a la tarea en curso.",
 	},
 	MsgMessageQueued: {
 		LangEnglish:            "📬 Message received — will process after the current task finishes.",
@@ -639,6 +743,13 @@ var messages = map[MsgKey]map[Language]string{
 		LangTraditionalChinese: "📬 訊息已收到，將在目前任務完成後處理。",
 		LangJapanese:           "📬 メッセージを受信しました。現在のタスク完了後に処理します。",
 		LangSpanish:            "📬 Mensaje recibido — se procesará después de que termine la tarea actual.",
+	},
+	MsgQueueFull: {
+		LangEnglish:            "📬 Message queue is full (%d pending). Please wait for current tasks to complete.",
+		LangChinese:            "📬 消息队列已满（%d 条待处理）。请等待当前任务完成。",
+		LangTraditionalChinese: "📬 訊息佇列已滿（%d 則待處理）。請等待目前任務完成。",
+		LangJapanese:           "📬 メッセージキューが満杯です（%d 件待ち）。現在のタスク完了をお待ちください。",
+		LangSpanish:            "📬 La cola de mensajes está llena (%d pendientes). Espere a que las tareas actuales se completen.",
 	},
 	MsgNoToolsAllowed: {
 		LangEnglish:            "No tools pre-allowed.\nUsage: `/allow <tool_name>`\nExample: `/allow Bash`",
@@ -688,6 +799,20 @@ var messages = map[MsgKey]map[Language]string{
 		LangTraditionalChinese: "❌ 錯誤: %v",
 		LangJapanese:           "❌ エラー: %v",
 		LangSpanish:            "❌ Error: %v",
+	},
+	MsgBackgroundAutoDenied: {
+		LangEnglish:            "⚠️ Background task requested permission for `%s` but was auto-denied (no active user turn). Send a message or use `/yolo` to approve future requests.",
+		LangChinese:            "⚠️ 后台任务请求使用工具 `%s` 的权限，但已自动拒绝（当前无活跃会话）。请发送消息或使用 `/yolo` 授权后续请求。",
+		LangTraditionalChinese: "⚠️ 後台任務請求使用工具 `%s` 的權限，但已自動拒絕（目前無活躍會話）。請發送訊息或使用 `/yolo` 授權後續請求。",
+		LangJapanese:           "⚠️ バックグラウンドタスクがツール `%s` の権限を要求しましたが、自動的に拒否されました（アクティブなユーザーターンなし）。メッセージを送信するか `/yolo` を使用して今後のリクエストを承認してください。",
+		LangSpanish:            "⚠️ Una tarea en segundo plano solicitó permiso para `%s` pero se denegó automáticamente (sin turno de usuario activo). Envía un mensaje o usa `/yolo` para aprobar solicitudes futuras.",
+	},
+	MsgSessionNotFound: {
+		LangEnglish:            "⚠️ Session expired. Use /new to start a fresh conversation.",
+		LangChinese:            "⚠️ 会话已过期，请发送 /new 开始新会话",
+		LangTraditionalChinese: "⚠️ 會話已過期，請發送 /new 開始新會話",
+		LangJapanese:           "⚠️ セッションが期限切れです。/new で新しい会話を開始してください。",
+		LangSpanish:            "⚠️ Sesión expirada. Usa /new para iniciar una nueva conversación.",
 	},
 	MsgFailedToStartAgentSession: {
 		LangEnglish:            "❌ Error: failed to start agent session",
@@ -759,6 +884,13 @@ var messages = map[MsgKey]map[Language]string{
 		LangJapanese:           "🔔 静音モード OFF — 思考とツール実行の進捗メッセージを表示します。",
 		LangSpanish:            "🔔 Modo silencioso desactivado — los mensajes de progreso se mostrarán.",
 	},
+	MsgDisplayModeCompact: {
+		LangEnglish:            "📋 Compact mode — thinking/tool hidden, each text segment sent separately.",
+		LangChinese:            "📋 紧凑模式 — 隐藏思考和工具消息，每段文本独立发送。",
+		LangTraditionalChinese: "📋 緊湊模式 — 隱藏思考和工具訊息，每段文字獨立發送。",
+		LangJapanese:           "📋 コンパクトモード — 思考・ツール非表示、テキストは個別に送信。",
+		LangSpanish:            "📋 Modo compacto — pensamiento/herramientas ocultos, cada segmento de texto enviado por separado.",
+	},
 	MsgQuietGlobalOn: {
 		LangEnglish:            "🔇 Global quiet mode ON — all sessions will hide thinking and tool progress.",
 		LangChinese:            "🔇 全局安静模式已开启 — 所有会话将不再推送思考和工具调用进度消息。",
@@ -801,6 +933,13 @@ var messages = map[MsgKey]map[Language]string{
 		LangJapanese:           "(新規 — まだ開始されていません)",
 		LangSpanish:            "(nuevo — aún no iniciado)",
 	},
+	MsgUntitled: {
+		LangEnglish:            "(untitled)",
+		LangChinese:            "(未命名)",
+		LangTraditionalChinese: "(未命名)",
+		LangJapanese:           "(無題)",
+		LangSpanish:            "(sin título)",
+	},
 	MsgLangChanged: {
 		LangEnglish:            "🌐 Language switched to **%s**.",
 		LangChinese:            "🌐 语言已切换为 **%s**。",
@@ -829,6 +968,13 @@ var messages = map[MsgKey]map[Language]string{
 		LangJapanese:           "`%s` は cc-connect のコマンドではありません。エージェントに転送します...",
 		LangSpanish:            "`%s` no es un comando de cc-connect, reenviando al agente...",
 	},
+	MsgWelcome: {
+		LangEnglish:            "👋 Hi! I'm cc-connect, bridging you to **%s**.\n\nJust send a message to chat with the agent. Type /help to see built-in commands.",
+		LangChinese:            "👋 你好！我是 cc-connect，已为你连接到 **%s**。\n\n直接发送消息即可与 Agent 对话。输入 /help 查看内置命令。",
+		LangTraditionalChinese: "👋 你好！我是 cc-connect，已為你連接到 **%s**。\n\n直接發送訊息即可與 Agent 對話。輸入 /help 查看內建命令。",
+		LangJapanese:           "👋 こんにちは！cc-connect が **%s** に接続しました。\n\nメッセージを送信すればエージェントと会話できます。/help で組み込みコマンド一覧を確認できます。",
+		LangSpanish:            "👋 ¡Hola! Soy cc-connect, conectándote con **%s**.\n\nEnvía un mensaje para chatear con el agente. Usa /help para ver los comandos integrados.",
+	},
 	MsgHelp: {
 		LangEnglish: "📖 Available Commands\n\n" +
 			"/new [name]\n  Start a new session\n\n" +
@@ -848,11 +994,12 @@ var messages = map[MsgKey]map[Language]string{
 			"/lang [en|zh|zh-TW|ja|es|auto]\n  View/switch language\n\n" +
 			"/compress\n  Compress conversation context\n\n" +
 			"/tts [always|voice_only]\n  View/switch text-to-speech mode\n\n" +
-			"/shell <command>\n  Run a shell command and return the output\n\n" +
+			"/shell [--timeout <sec>] <command>\n  Run a shell command and return the output (! prefix shortcut: !cmd)\n\n" +
 			"/show <ref>\n  View a file, directory, or code snippet by reference\n\n" +
 			"/dir [path|reset]\n  Show, switch, or reset agent working directory\n\n" +
 			"/stop\n  Stop current execution\n\n" +
-			"/cron [add|list|del|enable|disable]\n  Manage scheduled tasks\n\n" +
+			"/cron [add|list|exec|del|enable|disable]\n  Manage scheduled tasks\n\n" +
+			"/timer [add|list|del|mute|unmute]\n  Manage one-shot timers\n\n" +
 			"/heartbeat [status|pause|resume|run|interval]\n  Manage heartbeat\n\n" +
 			"/commands [add|del]\n  Manage custom slash commands\n\n" +
 			"/alias [add|del]\n  Manage command aliases (e.g. 帮助 → /help)\n\n" +
@@ -891,11 +1038,12 @@ var messages = map[MsgKey]map[Language]string{
 			"/lang [en|zh|zh-TW|ja|es|auto]\n  查看/切换语言\n\n" +
 			"/compress\n  压缩会话上下文\n\n" +
 			"/tts [always|voice_only]\n  查看/切换语音合成模式\n\n" +
-			"/shell <命令>\n  执行 Shell 命令并返回结果\n\n" +
+			"/shell [--timeout <秒>] <命令>\n  执行 Shell 命令并返回结果（快捷方式：!命令）\n\n" +
 			"/show <引用>\n  按引用查看文件、目录或代码片段\n\n" +
 			"/dir [路径|reset]\n  查看、切换或重置 Agent 工作目录\n\n" +
 			"/stop\n  停止当前执行\n\n" +
-			"/cron [add|list|del|enable|disable]\n  管理定时任务\n\n" +
+			"/cron [add|list|exec|del|enable|disable]\n  管理定时任务\n\n" +
+			"/timer [add|list|del|mute|unmute]\n  管理一次性定时器\n\n" +
 			"/heartbeat [status|pause|resume|run|interval]\n  管理心跳\n\n" +
 			"/commands [add|del]\n  管理自定义命令\n\n" +
 			"/alias [add|del]\n  管理命令别名（如 帮助 → /help）\n\n" +
@@ -934,10 +1082,11 @@ var messages = map[MsgKey]map[Language]string{
 			"/lang [en|zh|zh-TW|ja|es|auto]\n  查看/切換語言\n\n" +
 			"/compress\n  壓縮會話上下文\n\n" +
 			"/tts [always|voice_only]\n  查看/切換語音合成模式\n\n" +
-			"/shell <命令>\n  執行 Shell 命令並返回結果\n\n" +
+			"/shell [--timeout <秒>] <命令>\n  執行 Shell 命令並返回結果（快捷方式：!命令）\n\n" +
 			"/dir [路徑|reset]\n  查看、切換或重置 Agent 工作目錄\n\n" +
 			"/stop\n  停止當前執行\n\n" +
-			"/cron [add|list|del|enable|disable]\n  管理定時任務\n\n" +
+			"/cron [add|list|exec|del|enable|disable]\n  管理定時任務\n\n" +
+			"/timer [add|list|del|mute|unmute]\n  管理一次性定時器\n\n" +
 			"/heartbeat [status|pause|resume|run|interval]\n  管理心跳\n\n" +
 			"/commands [add|del]\n  管理自訂命令\n\n" +
 			"/alias [add|del]\n  管理命令別名（如 幫助 → /help）\n\n" +
@@ -975,10 +1124,11 @@ var messages = map[MsgKey]map[Language]string{
 			"/lang [en|zh|zh-TW|ja|es|auto]\n  言語の表示/切り替え\n\n" +
 			"/compress\n  会話コンテキストを圧縮\n\n" +
 			"/tts [always|voice_only]\n  音声合成モードの表示/切り替え\n\n" +
-			"/shell <コマンド>\n  シェルコマンドを実行して結果を返す\n\n" +
+			"/shell [--timeout <秒>] <コマンド>\n  シェルコマンドを実行して結果を返す（ショートカット：!コマンド）\n\n" +
 			"/dir [パス|reset]\n  エージェントの作業ディレクトリを表示/切り替え/リセット\n\n" +
 			"/stop\n  現在の実行を停止\n\n" +
-			"/cron [add|list|del|enable|disable]\n  スケジュールタスク管理\n\n" +
+			"/cron [add|list|exec|del|enable|disable]\n  スケジュールタスク管理\n\n" +
+			"/timer [add|list|del|mute|unmute]\n  ワンショットタイマー管理\n\n" +
 			"/heartbeat [status|pause|resume|run|interval]\n  ハートビート管理\n\n" +
 			"/commands [add|del]\n  カスタムコマンド管理\n\n" +
 			"/alias [add|del]\n  コマンドエイリアス管理（例: ヘルプ → /help）\n\n" +
@@ -1016,10 +1166,11 @@ var messages = map[MsgKey]map[Language]string{
 			"/lang [en|zh|zh-TW|ja|es|auto]\n  Ver/cambiar idioma\n\n" +
 			"/compress\n  Comprimir contexto de conversación\n\n" +
 			"/tts [always|voice_only]\n  Ver/cambiar modo de síntesis de voz\n\n" +
-			"/shell <comando>\n  Ejecutar un comando shell y devolver la salida\n\n" +
+			"/shell [--timeout <seg>] <comando>\n  Ejecutar un comando shell y devolver la salida (atajo: !comando)\n\n" +
 			"/dir [ruta|reset]\n  Ver, cambiar o restablecer el directorio de trabajo del agente\n\n" +
 			"/stop\n  Detener ejecución actual\n\n" +
-			"/cron [add|list|del|enable|disable]\n  Gestionar tareas programadas\n\n" +
+			"/cron [add|list|exec|del|enable|disable]\n  Gestionar tareas programadas\n\n" +
+			"/timer [add|list|del|mute|unmute]\n  Gestionar temporizadores de uso único\n\n" +
 			"/heartbeat [status|pause|resume|run|interval]\n  Gestionar heartbeat\n\n" +
 			"/commands [add|del]\n  Gestionar comandos personalizados\n\n" +
 			"/alias [add|del]\n  Gestionar alias de comandos (ej. ayuda → /help)\n\n" +
@@ -1134,47 +1285,55 @@ var messages = map[MsgKey]map[Language]string{
 	},
 	MsgHelpToolsSection: {
 		LangEnglish: "**Tools & Automation**\n" +
-			"/shell <command> — Run a shell command\n" +
+			"/shell <command> — Run a shell command (! shortcut)\n" +
 			"/show <ref> — View file / directory / snippet by reference\n" +
 			"/dir [path|reset] — Show, switch, or reset work directory\n" +
-			"/cron [add|list|del|...] — Scheduled tasks\n" +
+			"/cron [add|list|exec|del|...] — Scheduled tasks\n" +
+			"/timer [add|list|del|...] — One-shot timers\n" +
 			"/commands [add|del] — Custom commands\n" +
 			"/alias [add|del] — Command aliases\n" +
 			"/skills — List agent skills\n" +
 			"/compress — Compress context\n" +
 			"/stop — Stop current execution",
 		LangChinese: "**工具与自动化**\n" +
-			"/shell <命令> — 执行 Shell 命令\n" +
+			"/shell <命令> — 执行 Shell 命令（!快捷方式）\n" +
 			"/show <引用> — 按引用查看文件、目录或代码片段\n" +
 			"/dir [路径|reset] — 查看、切换或重置工作目录\n" +
-			"/cron [add|list|del|...] — 定时任务\n" +
+			"/cron [add|list|exec|del|...] — 定时任务\n" +
+			"/timer [add|list|del|...] — 一次性定时器\n" +
 			"/commands [add|del] — 自定义命令\n" +
 			"/alias [add|del] — 命令别名\n" +
 			"/skills — 列出 Agent Skills\n" +
 			"/compress — 压缩上下文\n" +
 			"/stop — 停止当前执行",
 		LangTraditionalChinese: "**工具與自動化**\n" +
-			"/shell <命令> — 執行 Shell 命令\n" +
+			"/shell <命令> — 執行 Shell 命令（!快捷方式）\n" +
+			"/show <引用> — 按引用查看檔案、目錄或程式碼片段\n" +
 			"/dir [路徑|reset] — 查看、切換或重置工作目錄\n" +
-			"/cron [add|list|del|...] — 定時任務\n" +
+			"/cron [add|list|exec|del|...] — 定時任務\n" +
+			"/timer [add|list|del|...] — 一次性定時器\n" +
 			"/commands [add|del] — 自訂命令\n" +
 			"/alias [add|del] — 命令別名\n" +
 			"/skills — 列出 Agent Skills\n" +
 			"/compress — 壓縮上下文\n" +
 			"/stop — 停止當前執行",
 		LangJapanese: "**ツール・自動化**\n" +
-			"/shell <コマンド> — シェルコマンド実行\n" +
+			"/shell <コマンド> — シェルコマンド実行（!ショートカット）\n" +
+			"/show <参照> — ファイル/ディレクトリ/スニペットを参照で表示\n" +
 			"/dir [パス|reset] — 作業ディレクトリの表示/切り替え/リセット\n" +
-			"/cron [add|list|del|...] — スケジュールタスク\n" +
+			"/cron [add|list|exec|del|...] — スケジュールタスク\n" +
+			"/timer [add|list|del|...] — ワンショットタイマー\n" +
 			"/commands [add|del] — カスタムコマンド\n" +
 			"/alias [add|del] — コマンドエイリアス\n" +
 			"/skills — エージェントスキル一覧\n" +
 			"/compress — コンテキスト圧縮\n" +
 			"/stop — 現在の実行を停止",
 		LangSpanish: "**Herramientas y automatización**\n" +
-			"/shell <comando> — Ejecutar comando shell\n" +
+			"/shell <comando> — Ejecutar comando shell (! atajo)\n" +
+			"/show <ref> — Ver archivo/directorio/fragmento por referencia\n" +
 			"/dir [ruta|reset] — Ver, cambiar o restablecer directorio de trabajo\n" +
-			"/cron [add|list|del|...] — Tareas programadas\n" +
+			"/cron [add|list|exec|del|...] — Tareas programadas\n" +
+			"/timer [add|list|del|...] — Temporizadores de uso único\n" +
 			"/commands [add|del] — Comandos personalizados\n" +
 			"/alias [add|del] — Alias de comandos\n" +
 			"/skills — Listar skills del agente\n" +
@@ -1425,6 +1584,46 @@ var messages = map[MsgKey]map[Language]string{
 		LangJapanese:           "❌ プロバイダの削除に失敗しました: %v",
 		LangSpanish:            "❌ Error al eliminar proveedor: %v",
 	},
+	MsgCardTitleProviderAdd: {
+		LangEnglish: "Add Provider", LangChinese: "添加服务商", LangTraditionalChinese: "新增服務商",
+		LangJapanese: "プロバイダーを追加", LangSpanish: "Añadir proveedor",
+	},
+	MsgProviderAddPickHint: {
+		LangEnglish:            "Pick a provider below, or choose **Other** to enter manually.\nAfter selecting, send your API key to complete.",
+		LangChinese:            "选择一个服务商，或选择 **自定义** 手动填写。\n选择后，请发送你的 API Key 来完成添加。",
+		LangTraditionalChinese: "選擇一個服務商，或選擇 **自訂** 手動填寫。\n選擇後，請傳送你的 API Key 來完成新增。",
+		LangJapanese:           "プロバイダーを選択するか、**その他** を選んで手動入力してください。\n選択後、API キーを送信して完了します。",
+		LangSpanish:            "Elige un proveedor o selecciona **Otro** para ingresar manualmente.\nDespués de seleccionar, envía tu API Key para completar.",
+	},
+	MsgProviderAddOther: {
+		LangEnglish: "Other (manual)", LangChinese: "自定义 (手动)", LangTraditionalChinese: "自訂 (手動)",
+		LangJapanese: "その他 (手動)", LangSpanish: "Otro (manual)",
+	},
+	MsgProviderAddApiKeyPrompt: {
+		LangEnglish:            "✅ Selected **%s**.\n\nPlease send your **API Key** for this provider.\nFormat: just the key, e.g. `sk-xxxxxxxx`",
+		LangChinese:            "✅ 已选择 **%s**。\n\n请发送你的 **API Key**。\n格式：直接发送密钥即可，如 `sk-xxxxxxxx`",
+		LangTraditionalChinese: "✅ 已選擇 **%s**。\n\n請傳送你的 **API Key**。\n格式：直接傳送金鑰即可，如 `sk-xxxxxxxx`",
+		LangJapanese:           "✅ **%s** を選択しました。\n\n**API キー** を送信してください。\n形式: キーをそのまま送信（例: `sk-xxxxxxxx`）",
+		LangSpanish:            "✅ Seleccionado **%s**.\n\nPor favor envía tu **API Key** para este proveedor.\nFormato: solo la clave, por ejemplo `sk-xxxxxxxx`",
+	},
+	MsgProviderAddInviteHint: {
+		LangEnglish:            "🔑 Don't have a key? Register here: %s",
+		LangChinese:            "🔑 还没有 Key？点击注册获取：%s",
+		LangTraditionalChinese: "🔑 還沒有 Key？點擊註冊取得：%s",
+		LangJapanese:           "🔑 キーをお持ちでない場合はこちらから登録: %s",
+		LangSpanish:            "🔑 ¿No tienes una clave? Regístrate aquí: %s",
+	},
+	MsgProviderLinkGlobal: {
+		LangEnglish: "Link existing provider", LangChinese: "关联已有服务商", LangTraditionalChinese: "關聯已有服務商",
+		LangJapanese: "既存プロバイダーをリンク", LangSpanish: "Vincular proveedor existente",
+	},
+	MsgProviderLinked: {
+		LangEnglish:            "✅ Provider **%s** linked to this project.",
+		LangChinese:            "✅ 已关联服务商 **%s** 到当前项目。",
+		LangTraditionalChinese: "✅ 已關聯服務商 **%s** 到目前專案。",
+		LangJapanese:           "✅ プロバイダー **%s** をこのプロジェクトにリンクしました。",
+		LangSpanish:            "✅ Proveedor **%s** vinculado a este proyecto.",
+	},
 	MsgVoiceNotEnabled: {
 		LangEnglish:            "🎙 Voice messages are not enabled. Please configure `[speech]` in config.toml.",
 		LangChinese:            "🎙 语音消息未启用，请在 config.toml 中配置 `[speech]` 部分。",
@@ -1606,11 +1805,11 @@ var messages = map[MsgKey]map[Language]string{
 		LangSpanish:            "El programador de tareas no está disponible.",
 	},
 	MsgCronUsage: {
-		LangEnglish:            "Usage:\n/cron add <min> <hour> <day> <month> <weekday> <prompt>\n/cron list\n/cron del <id>\n/cron enable <id> · /cron disable <id>\n/cron mute <id> · /cron unmute <id>\n/cron setup — write cc-connect instructions to agent memory file",
-		LangChinese:            "用法：\n/cron add <分> <时> <日> <月> <周> <任务描述>\n/cron list\n/cron del <id>\n/cron enable <id> · /cron disable <id>\n/cron mute <id> · /cron unmute <id> 静音/取消静音\n/cron setup — 将 cc-connect 指令写入 agent 记忆文件",
-		LangTraditionalChinese: "用法：\n/cron add <分> <時> <日> <月> <週> <任務描述>\n/cron list\n/cron del <id>\n/cron enable <id> · /cron disable <id>\n/cron mute <id> · /cron unmute <id> 靜音/取消靜音\n/cron setup — 將 cc-connect 指令寫入 agent 記憶檔案",
-		LangJapanese:           "使い方:\n/cron add <分> <時> <日> <月> <曜日> <タスク内容>\n/cron list\n/cron del <id>\n/cron enable <id> · /cron disable <id>\n/cron mute <id> · /cron unmute <id> ミュート/解除\n/cron setup — cc-connect の指示をエージェントのメモリファイルに書き込む",
-		LangSpanish:            "Uso:\n/cron add <min> <hora> <día> <mes> <día_semana> <tarea>\n/cron list\n/cron del <id>\n/cron enable <id> · /cron disable <id>\n/cron mute <id> · /cron unmute <id>\n/cron setup — escribir las instrucciones de cc-connect en el archivo de memoria del agente",
+		LangEnglish:            "Usage:\n/cron add <min> <hour> <day> <month> <weekday> <prompt>\n/cron list\n/cron exec <id>\n/cron del <id>\n/cron enable <id> · /cron disable <id>\n/cron mute <id> · /cron unmute <id>\n/cron setup — write cc-connect instructions to agent memory file",
+		LangChinese:            "用法：\n/cron add <分> <时> <日> <月> <周> <任务描述>\n/cron list\n/cron exec <id> 立即执行\n/cron del <id>\n/cron enable <id> · /cron disable <id>\n/cron mute <id> · /cron unmute <id> 静音/取消静音\n/cron setup — 将 cc-connect 指令写入 agent 记忆文件",
+		LangTraditionalChinese: "用法：\n/cron add <分> <時> <日> <月> <週> <任務描述>\n/cron list\n/cron exec <id> 立即執行\n/cron del <id>\n/cron enable <id> · /cron disable <id>\n/cron mute <id> · /cron unmute <id> 靜音/取消靜音\n/cron setup — 將 cc-connect 指令寫入 agent 記憶檔案",
+		LangJapanese:           "使い方:\n/cron add <分> <時> <日> <月> <曜日> <タスク内容>\n/cron list\n/cron exec <id> 今すぐ実行\n/cron del <id>\n/cron enable <id> · /cron disable <id>\n/cron mute <id> · /cron unmute <id> ミュート/解除\n/cron setup — cc-connect の指示をエージェントのメモリファイルに書き込む",
+		LangSpanish:            "Uso:\n/cron add <min> <hora> <día> <mes> <día_semana> <tarea>\n/cron list\n/cron exec <id>\n/cron del <id>\n/cron enable <id> · /cron disable <id>\n/cron mute <id> · /cron unmute <id>\n/cron setup — escribir las instrucciones de cc-connect en el archivo de memoria del agente",
 	},
 	MsgCronAddUsage: {
 		LangEnglish:            "Usage: /cron add <min> <hour> <day> <month> <weekday> <prompt>\nExample: /cron add 0 6 * * * Collect GitHub trending data and send me a summary",
@@ -1655,11 +1854,32 @@ var messages = map[MsgKey]map[Language]string{
 		LangSpanish:            "⏰ Tareas programadas (%d)",
 	},
 	MsgCronListFooter: {
-		LangEnglish:            "`/cron del <id>` remove · `/cron enable/disable <id>` toggle · `/cron mute/unmute <id>` mute",
-		LangChinese:            "`/cron del <id>` 删除 · `/cron enable/disable <id>` 启停 · `/cron mute/unmute <id>` 静音",
-		LangTraditionalChinese: "`/cron del <id>` 刪除 · `/cron enable/disable <id>` 啟停 · `/cron mute/unmute <id>` 靜音",
-		LangJapanese:           "`/cron del <id>` 削除 · `/cron enable/disable <id>` 切替 · `/cron mute/unmute <id>` ミュート",
-		LangSpanish:            "`/cron del <id>` eliminar · `/cron enable/disable <id>` activar/desactivar · `/cron mute/unmute <id>` silenciar",
+		LangEnglish:            "`/cron exec <id>` trigger now · `/cron del <id>` remove · `/cron enable/disable <id>` toggle · `/cron mute/unmute <id>` mute",
+		LangChinese:            "`/cron exec <id>` 立即触发 · `/cron del <id>` 删除 · `/cron enable/disable <id>` 启停 · `/cron mute/unmute <id>` 静音",
+		LangTraditionalChinese: "`/cron exec <id>` 立即觸發 · `/cron del <id>` 刪除 · `/cron enable/disable <id>` 啟停 · `/cron mute/unmute <id>` 靜音",
+		LangJapanese:           "`/cron exec <id>` 今すぐ実行 · `/cron del <id>` 削除 · `/cron enable/disable <id>` 切替 · `/cron mute/unmute <id>` ミュート",
+		LangSpanish:            "`/cron exec <id>` ejecutar ahora · `/cron del <id>` eliminar · `/cron enable/disable <id>` activar/desactivar · `/cron mute/unmute <id>` silenciar",
+	},
+	MsgCronExecUsage: {
+		LangEnglish:            "Usage: /cron exec <id>",
+		LangChinese:            "用法：/cron exec <id>",
+		LangTraditionalChinese: "用法：/cron exec <id>",
+		LangJapanese:           "使い方: /cron exec <id>",
+		LangSpanish:            "Uso: /cron exec <id>",
+	},
+	MsgCronTriggered: {
+		LangEnglish:            "▶️ Cron job `%s` triggered.",
+		LangChinese:            "▶️ 定时任务 `%s` 已触发。",
+		LangTraditionalChinese: "▶️ 定時任務 `%s` 已觸發。",
+		LangJapanese:           "▶️ スケジュールタスク `%s` を実行しました。",
+		LangSpanish:            "▶️ Tarea programada `%s` ejecutada.",
+	},
+	MsgCronProjectUnavailable: {
+		LangEnglish:            "❌ This cron job cannot be triggered because its project is no longer available.",
+		LangChinese:            "❌ 该定时任务关联的项目已不可用，无法触发。",
+		LangTraditionalChinese: "❌ 該定時任務關聯的專案已不可用，無法觸發。",
+		LangJapanese:           "❌ このスケジュールタスクは、関連するプロジェクトが利用できないため実行できません。",
+		LangSpanish:            "❌ Esta tarea programada no puede ejecutarse porque su proyecto ya no está disponible.",
 	},
 	MsgCronDelUsage: {
 		LangEnglish:            "Usage: /cron del <id>",
@@ -1711,11 +1931,11 @@ var messages = map[MsgKey]map[Language]string{
 		LangSpanish:            "🔔 Tarea programada `%s` reactivada.",
 	},
 	MsgCronCardHint: {
-		LangEnglish:            "💡 `/cron add` · `/cron del <id>` · `/cron enable/disable <id>` · `/cron mute/unmute <id>`",
-		LangChinese:            "💡 `/cron add` 添加 · `/cron del <id>` 删除 · `/cron enable/disable <id>` 启停 · `/cron mute/unmute <id>` 静音",
-		LangTraditionalChinese: "💡 `/cron add` 新增 · `/cron del <id>` 刪除 · `/cron enable/disable <id>` 啟停 · `/cron mute/unmute <id>` 靜音",
-		LangJapanese:           "💡 `/cron add` 追加 · `/cron del <id>` 削除 · `/cron enable/disable <id>` 切替 · `/cron mute/unmute <id>` ミュート",
-		LangSpanish:            "💡 `/cron add` · `/cron del <id>` · `/cron enable/disable <id>` · `/cron mute/unmute <id>`",
+		LangEnglish:            "💡 `/cron add` · `/cron exec <id>` · `/cron del <id>` · `/cron enable/disable <id>` · `/cron mute/unmute <id>`",
+		LangChinese:            "💡 `/cron add` 添加 · `/cron exec <id>` 触发 · `/cron del <id>` 删除 · `/cron enable/disable <id>` 启停 · `/cron mute/unmute <id>` 静音",
+		LangTraditionalChinese: "💡 `/cron add` 新增 · `/cron exec <id>` 觸發 · `/cron del <id>` 刪除 · `/cron enable/disable <id>` 啟停 · `/cron mute/unmute <id>` 靜音",
+		LangJapanese:           "💡 `/cron add` 追加 · `/cron exec <id>` 実行 · `/cron del <id>` 削除 · `/cron enable/disable <id>` 切替 · `/cron mute/unmute <id>` ミュート",
+		LangSpanish:            "💡 `/cron add` · `/cron exec <id>` · `/cron del <id>` · `/cron enable/disable <id>` · `/cron mute/unmute <id>`",
 	},
 	MsgCronBtnEnable: {
 		LangEnglish:            "Enable",
@@ -1766,42 +1986,213 @@ var messages = map[MsgKey]map[Language]string{
 		LangJapanese:           "前回",
 		LangSpanish:            "Últ",
 	},
+
+	// ── Timer (one-shot) ──────────────────────────────────────
+
+	MsgCardTitleTimer: {
+		LangEnglish:            "One-Shot Timer",
+		LangChinese:            "一次性定时器",
+		LangTraditionalChinese: "一次性定時器",
+		LangJapanese:           "ワンショットタイマー",
+		LangSpanish:            "Temporizador único",
+	},
+	MsgTimerNotAvailable: {
+		LangEnglish:            "Timer scheduler is not available.",
+		LangChinese:            "定时器调度器未启用。",
+		LangTraditionalChinese: "定時器調度器未啟用。",
+		LangJapanese:           "タイマースケジューラは利用できません。",
+		LangSpanish:            "El programador de temporizador no está disponible.",
+	},
+	MsgTimerUsage: {
+		LangEnglish:            "Usage:\n/timer add <delay|time> <prompt>\n/timer addexec <delay|time> <command>\n/timer list\n/timer del <id>\n/timer mute <id> · /timer unmute <id>\n\nDelay: 30m, 2h, 1h30m. Or absolute time: 2026-05-16T09:00\nTime without timezone uses system local time.",
+		LangChinese:            "用法：\n/timer add <延迟|时间> <任务描述>\n/timer addexec <延迟|时间> <命令>\n/timer list\n/timer del <id>\n/timer mute <id> · /timer unmute <id>\n\n延迟：30m、2h、1h30m。或绝对时间：2026-05-16T09:00\n不带时区的时间按系统本地时区解析。",
+		LangTraditionalChinese: "用法：\n/timer add <延遲|時間> <任務描述>\n/timer addexec <延遲|時間> <命令>\n/timer list\n/timer del <id>\n/timer mute <id> · /timer unmute <id>\n\n延遲：30m、2h、1h30m。或絕對時間：2026-05-16T09:00\n不帶時區的時間按系統本地時區解析。",
+		LangJapanese:           "使い方:\n/timer add <遅延|時刻> <タスク内容>\n/timer addexec <遅延|時刻> <コマンド>\n/timer list\n/timer del <id>\n/timer mute <id> · /timer unmute <id>\n\n遅延: 30m, 2h, 1h30m。または絶対時刻: 2026-05-16T09:00\nタイムゾーンなしの時刻はシステムのローカルタイムゾーンで解釈されます。",
+		LangSpanish:            "Uso:\n/timer add <retraso|hora> <tarea>\n/timer addexec <retraso|hora> <comando>\n/timer list\n/timer del <id>\n/timer mute <id> · /timer unmute <id>\n\nRetraso: 30m, 2h, 1h30m. O hora absoluta: 2026-05-16T09:00\nHora sin zona horaria usa la hora local del sistema.",
+	},
+	MsgTimerAddUsage: {
+		LangEnglish:            "Usage: /timer add <delay|time> <prompt>\nExamples:\n  /timer add 2h Check PR status\n  /timer add 2026-05-16T09:00 Morning standup reminder\nDelay: 30m, 2h, 1h30m. Time: ISO format (2026-05-16T09:00)\nTime without timezone uses system local time.",
+		LangChinese:            "用法：/timer add <延迟|时间> <任务描述>\n示例：\n  /timer add 2h 检查PR状态\n  /timer add 2026-05-16T09:00 早会提醒\n延迟：30m、2h、1h30m。时间：ISO格式（2026-05-16T09:00）\n不带时区的时间按系统本地时区解析。",
+		LangTraditionalChinese: "用法：/timer add <延遲|時間> <任務描述>\n範例：\n  /timer add 2h 檢查PR狀態\n  /timer add 2026-05-16T09:00 早會提醒\n延遲：30m、2h、1h30m。時間：ISO格式（2026-05-16T09:00）\n不帶時區的時間按系統本地時區解析。",
+		LangJapanese:           "使い方: /timer add <遅延|時刻> <タスク内容>\n例:\n  /timer add 2h PRの状態を確認\n  /timer add 2026-05-16T09:00 朝会リマインダー\n遅延: 30m, 2h, 1h30m。時刻: ISO形式（2026-05-16T09:00）\nタイムゾーンなしの時刻はシステムのローカルタイムゾーンで解釈されます。",
+		LangSpanish:            "Uso: /timer add <retraso|hora> <tarea>\nEjemplos:\n  /timer add 2h Verificar estado del PR\n  /timer add 2026-05-16T09:00 Recordatorio de reunión\nRetraso: 30m, 2h, 1h30m. Hora: formato ISO (2026-05-16T09:00)\nHora sin zona horaria usa la hora local del sistema.",
+	},
+	MsgTimerAdded: {
+		LangEnglish:            "✅ Timer created\nID: `%s`\nFires in: %s\nPrompt: %s",
+		LangChinese:            "✅ 定时器已创建\nID: `%s`\n将在 %s 后触发\n内容: %s",
+		LangTraditionalChinese: "✅ 定時器已建立\nID: `%s`\n將在 %s 後觸發\n內容: %s",
+		LangJapanese:           "✅ タイマーを作成しました\nID: `%s`\n%s 後に実行\n内容: %s",
+		LangSpanish:            "✅ Temporizador creado\nID: `%s`\nSe ejecuta en: %s\nContenido: %s",
+	},
+	MsgTimerAddedExec: {
+		LangEnglish:            "✅ Shell timer created\nID: `%s`\nFires in: %s\nCommand: `%s`",
+		LangChinese:            "✅ Shell 定时器已创建\nID: `%s`\n将在 %s 后触发\n命令: `%s`",
+		LangTraditionalChinese: "✅ Shell 定時器已建立\nID: `%s`\n將在 %s 後觸發\n命令: `%s`",
+		LangJapanese:           "✅ Shell タイマーを作成しました\nID: `%s`\n%s 後に実行\nコマンド: `%s`",
+		LangSpanish:            "✅ Temporizador shell creado\nID: `%s`\nSe ejecuta en: %s\nComando: `%s`",
+	},
+	MsgTimerAddExecUsage: {
+		LangEnglish:            "Usage: /timer addexec <delay> <shell command>\nExample: /timer addexec 30m df -h",
+		LangChinese:            "用法：/timer addexec <延迟> <shell 命令>\n示例：/timer addexec 30m df -h",
+		LangTraditionalChinese: "用法：/timer addexec <延遲> <shell 命令>\n範例：/timer addexec 30m df -h",
+		LangJapanese:           "使い方: /timer addexec <遅延> <シェルコマンド>\n例: /timer addexec 30m df -h",
+		LangSpanish:            "Uso: /timer addexec <retraso> <comando shell>\nEjemplo: /timer addexec 30m df -h",
+	},
+	MsgTimerEmpty: {
+		LangEnglish:            "No pending timers.",
+		LangChinese:            "暂无待执行的定时器。",
+		LangTraditionalChinese: "暫無待執行的定時器。",
+		LangJapanese:           "保留中のタイマーはありません。",
+		LangSpanish:            "No hay temporizadores pendientes.",
+	},
+	MsgTimerListTitle: {
+		LangEnglish:            "⏰ Pending Timers (%d)",
+		LangChinese:            "⏰ 待执行定时器 (%d)",
+		LangTraditionalChinese: "⏰ 待執行定時器 (%d)",
+		LangJapanese:           "⏰ 保留中のタイマー (%d)",
+		LangSpanish:            "⏰ Temporizadores pendientes (%d)",
+	},
+	MsgTimerListFooter: {
+		LangEnglish:            "`/timer del <id>` remove · `/timer mute/unmute <id>` mute",
+		LangChinese:            "`/timer del <id>` 删除 · `/timer mute/unmute <id>` 静音",
+		LangTraditionalChinese: "`/timer del <id>` 刪除 · `/timer mute/unmute <id>` 靜音",
+		LangJapanese:           "`/timer del <id>` 削除 · `/timer mute/unmute <id>` ミュート",
+		LangSpanish:            "`/timer del <id>` eliminar · `/timer mute/unmute <id>` silenciar",
+	},
+	MsgTimerDelUsage: {
+		LangEnglish:            "Usage: /timer del <id>",
+		LangChinese:            "用法：/timer del <id>",
+		LangTraditionalChinese: "用法：/timer del <id>",
+		LangJapanese:           "使い方: /timer del <id>",
+		LangSpanish:            "Uso: /timer del <id>",
+	},
+	MsgTimerMuteUsage: {
+		LangEnglish:            "Usage: /timer mute <id> · /timer unmute <id>",
+		LangChinese:            "用法：/timer mute <id> · /timer unmute <id>",
+		LangTraditionalChinese: "用法：/timer mute <id> · /timer unmute <id>",
+		LangJapanese:           "使い方: /timer mute <id> · /timer unmute <id>",
+		LangSpanish:            "Uso: /timer mute <id> · /timer unmute <id>",
+	},
+	MsgTimerDeleted: {
+		LangEnglish:            "✅ Timer `%s` cancelled.",
+		LangChinese:            "✅ 定时器 `%s` 已取消。",
+		LangTraditionalChinese: "✅ 定時器 `%s` 已取消。",
+		LangJapanese:           "✅ タイマー `%s` をキャンセルしました。",
+		LangSpanish:            "✅ Temporizador `%s` cancelado.",
+	},
+	MsgTimerNotFound: {
+		LangEnglish:            "❌ Timer `%s` not found.",
+		LangChinese:            "❌ 定时器 `%s` 未找到。",
+		LangTraditionalChinese: "❌ 定時器 `%s` 未找到。",
+		LangJapanese:           "❌ タイマー `%s` が見つかりません。",
+		LangSpanish:            "❌ Temporizador `%s` no encontrado.",
+	},
+	MsgTimerMuted: {
+		LangEnglish:            "🔇 Timer `%s` muted.",
+		LangChinese:            "🔇 定时器 `%s` 已静音。",
+		LangTraditionalChinese: "🔇 定時器 `%s` 已靜音。",
+		LangJapanese:           "🔇 タイマー `%s` をミュートしました。",
+		LangSpanish:            "🔇 Temporizador `%s` silenciado.",
+	},
+	MsgTimerUnmuted: {
+		LangEnglish:            "🔔 Timer `%s` unmuted.",
+		LangChinese:            "🔔 定时器 `%s` 已取消静音。",
+		LangTraditionalChinese: "🔔 定時器 `%s` 已取消靜音。",
+		LangJapanese:           "🔔 タイマー `%s` のミュートを解除しました。",
+		LangSpanish:            "🔔 Temporizador `%s` reactivado.",
+	},
+	MsgTimerCardHint: {
+		LangEnglish:            "💡 `/timer add <delay> <prompt>` · `/timer del <id>` · `/timer mute/unmute <id>`",
+		LangChinese:            "💡 `/timer add <延迟> <内容>` 添加 · `/timer del <id>` 删除 · `/timer mute/unmute <id>` 静音",
+		LangTraditionalChinese: "💡 `/timer add <延遲> <內容>` 新增 · `/timer del <id>` 刪除 · `/timer mute/unmute <id>` 靜音",
+		LangJapanese:           "💡 `/timer add <遅延> <内容>` 追加 · `/timer del <id>` 削除 · `/timer mute/unmute <id>` ミュート",
+		LangSpanish:            "💡 `/timer add <retraso> <tarea>` · `/timer del <id>` · `/timer mute/unmute <id>`",
+	},
+	MsgTimerBtnMute: {
+		LangEnglish:            "Mute",
+		LangChinese:            "静音",
+		LangTraditionalChinese: "靜音",
+		LangJapanese:           "ミュート",
+		LangSpanish:            "Silenciar",
+	},
+	MsgTimerBtnUnmute: {
+		LangEnglish:            "Unmute",
+		LangChinese:            "取消静音",
+		LangTraditionalChinese: "取消靜音",
+		LangJapanese:           "ミュート解除",
+		LangSpanish:            "Reactivar",
+	},
+	MsgTimerBtnDelete: {
+		LangEnglish:            "Cancel Timer",
+		LangChinese:            "取消定时器",
+		LangTraditionalChinese: "取消定時器",
+		LangJapanese:           "タイマーをキャンセル",
+		LangSpanish:            "Cancelar temporizador",
+	},
+	MsgTimerIDLabel: {
+		LangEnglish: "ID: %s\n", LangChinese: "ID：%s\n", LangTraditionalChinese: "ID：%s\n",
+		LangJapanese: "ID: %s\n", LangSpanish: "ID: %s\n",
+	},
+	MsgTimerScheduledLabel: {
+		LangEnglish:            "Scheduled: %s (%s remaining)\n",
+		LangChinese:            "计划: %s（剩余 %s）\n",
+		LangTraditionalChinese: "計劃: %s（剩餘 %s）\n",
+		LangJapanese:           "予定: %s（残り %s）\n",
+		LangSpanish:            "Programado: %s (%s restante)\n",
+	},
+	MsgTimerFailedSuffix: {
+		LangEnglish: " (failed: %s)", LangChinese: "（失败：%s）", LangTraditionalChinese: "（失敗：%s）",
+		LangJapanese: "（失敗: %s）", LangSpanish: " (falló: %s)",
+	},
+
 	MsgStatusTitle: {
 		LangEnglish: "cc-connect Status\n\n" +
 			"Project: %s\n" +
 			"Agent: %s\n" +
+			"Work Dir: %s\n" +
 			"Platforms: %s\n" +
 			"Uptime: %s\n" +
 			"Language: %s\n" +
-			"%s" + "%s" + "%s" + "%s" + "%s",
+			"%s" + "%s" + "%s" + "%s" + "%s" + "%s",
 		LangChinese: "cc-connect 状态\n\n" +
 			"项目: %s\n" +
 			"Agent: %s\n" +
+			"工作目录: %s\n" +
 			"平台: %s\n" +
 			"运行时间: %s\n" +
 			"语言: %s\n" +
-			"%s" + "%s" + "%s" + "%s" + "%s",
+			"%s" + "%s" + "%s" + "%s" + "%s" + "%s",
 		LangTraditionalChinese: "cc-connect 狀態\n\n" +
 			"項目: %s\n" +
 			"Agent: %s\n" +
+			"工作目錄: %s\n" +
 			"平台: %s\n" +
 			"運行時間: %s\n" +
 			"語言: %s\n" +
-			"%s" + "%s" + "%s" + "%s" + "%s",
+			"%s" + "%s" + "%s" + "%s" + "%s" + "%s",
 		LangJapanese: "cc-connect ステータス\n\n" +
 			"プロジェクト: %s\n" +
 			"エージェント: %s\n" +
+			"作業ディレクトリ: %s\n" +
 			"プラットフォーム: %s\n" +
 			"稼働時間: %s\n" +
 			"言語: %s\n" +
-			"%s" + "%s" + "%s" + "%s" + "%s",
+			"%s" + "%s" + "%s" + "%s" + "%s" + "%s",
 		LangSpanish: "Estado de cc-connect\n\n" +
 			"Proyecto: %s\n" +
 			"Agente: %s\n" +
+			"Directorio: %s\n" +
 			"Plataformas: %s\n" +
 			"Tiempo activo: %s\n" +
 			"Idioma: %s\n" +
-			"%s" + "%s" + "%s" + "%s" + "%s",
+			"%s" + "%s" + "%s" + "%s" + "%s" + "%s",
+	},
+	MsgReplyFooterRemaining: {
+		LangEnglish:            "%d%% left",
+		LangChinese:            "剩余 %d%%",
+		LangTraditionalChinese: "剩餘 %d%%",
+		LangJapanese:           "残り %d%%",
+		LangSpanish:            "%d%% restante",
 	},
 	MsgModelCurrent: {
 		LangEnglish:            "Current model: %s",
@@ -1823,6 +2214,27 @@ var messages = map[MsgKey]map[Language]string{
 		LangTraditionalChinese: "❌ 切換模型失敗: %v",
 		LangJapanese:           "❌ モデルの切り替えに失敗しました: %v",
 		LangSpanish:            "❌ Error al cambiar el modelo: %v",
+	},
+	MsgModelCardSwitching: {
+		LangEnglish:            "Switching model to `%s`...",
+		LangChinese:            "正在切换模型为 `%s`...",
+		LangTraditionalChinese: "正在切換模型為 `%s`...",
+		LangJapanese:           "モデルを `%s` に切り替えています...",
+		LangSpanish:            "Cambiando el modelo a `%s`...",
+	},
+	MsgModelCardSwitched: {
+		LangEnglish:            "Model switched to `%s`.",
+		LangChinese:            "模型已切换为 `%s`。",
+		LangTraditionalChinese: "模型已切換為 `%s`。",
+		LangJapanese:           "モデルを `%s` に切り替えました。",
+		LangSpanish:            "Modelo cambiado a `%s`.",
+	},
+	MsgModelCardSwitchFailed: {
+		LangEnglish:            "Failed to switch model: %v",
+		LangChinese:            "切换模型失败: %v",
+		LangTraditionalChinese: "切換模型失敗: %v",
+		LangJapanese:           "モデルの切り替えに失敗しました: %v",
+		LangSpanish:            "Error al cambiar el modelo: %v",
 	},
 	MsgModelNotSupported: {
 		LangEnglish:            "This agent does not support model switching.",
@@ -2007,6 +2419,13 @@ var messages = map[MsgKey]map[Language]string{
 		LangJapanese:           "セッションキー: `%s`\n",
 		LangSpanish:            "Clave de sesión: `%s`\n",
 	},
+	MsgStatusAgentSID: {
+		LangEnglish:            "Agent SID: `%s`\n",
+		LangChinese:            "Agent SID: `%s`\n",
+		LangTraditionalChinese: "Agent SID: `%s`\n",
+		LangJapanese:           "Agent SID: `%s`\n",
+		LangSpanish:            "Agent SID: `%s`\n",
+	},
 	MsgStatusUserID: {
 		LangEnglish:            "User ID: `%s`\n",
 		LangChinese:            "User ID: `%s`\n",
@@ -2096,6 +2515,10 @@ var messages = map[MsgKey]map[Language]string{
 	MsgProviderSelectPlaceholder: {
 		LangEnglish: "Select provider", LangChinese: "选择 Provider", LangTraditionalChinese: "選擇 Provider",
 		LangJapanese: "プロバイダーを選択", LangSpanish: "Seleccionar proveedor",
+	},
+	MsgProviderClearOption: {
+		LangEnglish: "Do not use provider", LangChinese: "不使用服务商", LangTraditionalChinese: "不使用服務商",
+		LangJapanese: "プロバイダーを使用しない", LangSpanish: "No usar proveedor",
 	},
 	MsgCardBack: {
 		LangEnglish: "← Back", LangChinese: "← 返回", LangTraditionalChinese: "← 返回",
@@ -2297,6 +2720,13 @@ var messages = map[MsgKey]map[Language]string{
 		LangJapanese:           "ボタンが反応しない場合は、番号（例: 1）で返信するか、直接回答を入力してください",
 		LangSpanish:            "Si los botones no responden, responda con el número de opción (ej. 1) o escriba su respuesta",
 	},
+	MsgAskQuestionNoteMulti: {
+		LangEnglish:            "Reply with comma-separated option numbers (e.g. 1,3) or type your answer",
+		LangChinese:            "请回复逗号分隔的选项编号（如 1,3）或直接输入你的回答",
+		LangTraditionalChinese: "請回覆逗號分隔的選項編號（如 1,3）或直接輸入你的回答",
+		LangJapanese:           "カンマ区切りの番号（例: 1,3）で返信するか、直接回答を入力してください",
+		LangSpanish:            "Responda con los números de opción separados por comas (ej. 1,3) o escriba su respuesta",
+	},
 	MsgAskQuestionMulti: {
 		LangEnglish:            " (multiple selections allowed, separate with commas)",
 		LangChinese:            "（可多选，用逗号分隔）",
@@ -2443,6 +2873,13 @@ var messages = map[MsgKey]map[Language]string{
 		LangTraditionalChinese: "用法：/<skill名稱> [參數...] 來調用 Skill。",
 		LangJapanese:           "使い方：/<スキル名> [引数...] でスキルを実行します。",
 		LangSpanish:            "Uso: /<nombre-skill> [args...] para invocar un skill.",
+	},
+	MsgSkillsTelegramMenuHint: {
+		LangEnglish:            "Telegram's command menu is full, so skill commands are not listed there. You can still invoke them by typing /<skill-name> manually.",
+		LangChinese:            "Telegram 的命令菜单已满，因此 Skill 不会显示在那里。你仍然可以手动输入 /<skill名称> 来调用它们。",
+		LangTraditionalChinese: "Telegram 的命令選單已滿，因此 Skill 不會顯示在那裡。你仍然可以手動輸入 /<skill名稱> 來調用它們。",
+		LangJapanese:           "Telegram のコマンドメニューがいっぱいのため、スキルコマンドはそこに表示されません。手動で /<スキル名> と入力すれば実行できます。",
+		LangSpanish:            "El menú de comandos de Telegram está lleno, así que los skills no aparecen allí. Aun así puedes invocarlos escribiendo /<nombre-skill> manualmente.",
 	},
 
 	MsgConfigTitle: {
@@ -2859,6 +3296,20 @@ var messages = map[MsgKey]map[Language]string{
 		LangJapanese:           "削除結果",
 		LangSpanish:            "Resultado de eliminación",
 	},
+	MsgDeleteModeDeletingTitle: {
+		LangEnglish:            "Deleting Sessions...",
+		LangChinese:            "正在删除会话...",
+		LangTraditionalChinese: "正在刪除會話...",
+		LangJapanese:           "セッションを削除中...",
+		LangSpanish:            "Eliminando sesiones...",
+	},
+	MsgDeleteModeDeletingBody: {
+		LangEnglish:            "Deleting %d session(s), please wait...",
+		LangChinese:            "正在删除 %d 个会话，请稍候...",
+		LangTraditionalChinese: "正在刪除 %d 個會話，請稍候...",
+		LangJapanese:           "%d 件のセッションを削除中、お待ちください...",
+		LangSpanish:            "Eliminando %d sesión(es), por favor espere...",
+	},
 	MsgDeleteModeMissingSession: {
 		LangEnglish:            "❌ Missing selected session: %s",
 		LangChinese:            "❌ 已选会话不存在：%s",
@@ -2894,19 +3345,33 @@ var messages = map[MsgKey]map[Language]string{
 		LangJapanese:           "⏳ メッセージの送信が速すぎます。しばらくお待ちください。",
 		LangSpanish:            "⏳ Estás enviando mensajes demasiado rápido. Espera un momento.",
 	},
-	MsgBtwSent: {
-		LangEnglish:            "✅ Message injected into the current session.",
-		LangChinese:            "✅ 消息已注入当前会话。",
-		LangTraditionalChinese: "✅ 訊息已注入目前會話。",
-		LangJapanese:           "✅ メッセージを現在のセッションに注入しました。",
-		LangSpanish:            "✅ Mensaje inyectado en la sesión actual.",
+	MsgPsSent: {
+		LangEnglish:            "✅ P.S. delivered.",
+		LangChinese:            "✅ P.S. 已送达。",
+		LangTraditionalChinese: "✅ P.S. 已送達。",
+		LangJapanese:           "✅ P.S. を送信しました。",
+		LangSpanish:            "✅ P.S. entregado.",
 	},
-	MsgBtwSendFailed: {
-		LangEnglish:            "❌ Failed to inject message into the current session.",
-		LangChinese:            "❌ 消息注入当前会话失败。",
-		LangTraditionalChinese: "❌ 訊息注入目前會話失敗。",
-		LangJapanese:           "❌ 現在のセッションへのメッセージ注入に失敗しました。",
-		LangSpanish:            "❌ Error al inyectar el mensaje en la sesión actual.",
+	MsgPsSendFailed: {
+		LangEnglish:            "❌ Failed to deliver P.S.",
+		LangChinese:            "❌ P.S. 发送失败。",
+		LangTraditionalChinese: "❌ P.S. 傳送失敗。",
+		LangJapanese:           "❌ P.S. の送信に失敗しました。",
+		LangSpanish:            "❌ Error al entregar el P.S.",
+	},
+	MsgPsEmpty: {
+		LangEnglish:            "Usage: `/ps <message>`",
+		LangChinese:            "用法：`/ps <消息>`",
+		LangTraditionalChinese: "用法：`/ps <訊息>`",
+		LangJapanese:           "使い方：`/ps <メッセージ>`",
+		LangSpanish:            "Uso: `/ps <mensaje>`",
+	},
+	MsgPsNoSession: {
+		LangEnglish:            "No task is currently running.",
+		LangChinese:            "当前没有正在执行的任务。",
+		LangTraditionalChinese: "目前沒有正在執行的任務。",
+		LangJapanese:           "現在実行中のタスクはありません。",
+		LangSpanish:            "No hay ninguna tarea en ejecución.",
 	},
 	MsgWhoamiTitle: {
 		LangEnglish:            "🪪 **Your Identity**",
@@ -3201,11 +3666,11 @@ var messages = map[MsgKey]map[Language]string{
 		LangSpanish:            "Detener ejecución actual",
 	},
 	MsgBuiltinCmdCron: {
-		LangEnglish:            "Manage scheduled tasks, arg: [add|list|del|enable|disable]",
-		LangChinese:            "管理定时任务，参数: [add|list|del|enable|disable]",
-		LangTraditionalChinese: "管理定時任務，參數: [add|list|del|enable|disable]",
-		LangJapanese:           "スケジュールタスク管理、引数: [add|list|del|enable|disable]",
-		LangSpanish:            "Gestionar tareas programadas, arg: [add|list|del|enable|disable]",
+		LangEnglish:            "Manage scheduled tasks, arg: [add|list|exec|del|enable|disable]",
+		LangChinese:            "管理定时任务，参数: [add|list|exec|del|enable|disable]",
+		LangTraditionalChinese: "管理定時任務，參數: [add|list|exec|del|enable|disable]",
+		LangJapanese:           "スケジュールタスク管理、引数: [add|list|exec|del|enable|disable]",
+		LangSpanish:            "Gestionar tareas programadas, arg: [add|list|exec|del|enable|disable]",
 	},
 	MsgBuiltinCmdCommands: {
 		LangEnglish:            "Manage custom slash commands, arg: [add|del]",
@@ -3311,6 +3776,13 @@ var messages = map[MsgKey]map[Language]string{
 		LangTraditionalChinese: "產生 git diff 並以 HTML 檔案傳送，參數: [目標]",
 		LangJapanese:           "git diff を HTML ファイルで生成、引数: [ターゲット]",
 		LangSpanish:            "Generar git diff como archivo HTML, arg: [objetivo]",
+	},
+	MsgBuiltinCmdPs: {
+		LangEnglish:            "Send a P.S. to the running task",
+		LangChinese:            "向正在执行的任务追加补充信息",
+		LangTraditionalChinese: "向正在執行的任務追加補充資訊",
+		LangJapanese:           "実行中のタスクに補足情報を送信",
+		LangSpanish:            "Enviar un P.S. a la tarea en curso",
 	},
 	MsgDiffEmpty: {
 		LangEnglish:            "No diff — clean working tree (or no changes vs `%s`).",
@@ -3518,11 +3990,11 @@ var messages = map[MsgKey]map[Language]string{
 		LangSpanish:            "Uso: `/workspace [bind <nombre> | route <ruta-absoluta> | init <url> | unbind | list | shared ...]`",
 	},
 	MsgWsInitUsage: {
-		LangEnglish:            "Usage: `/workspace init <git-url>`",
-		LangChinese:            "用法: `/workspace init <git仓库地址>`",
-		LangTraditionalChinese: "用法: `/workspace init <git倉庫地址>`",
-		LangJapanese:           "使い方: `/workspace init <git-url>`",
-		LangSpanish:            "Uso: `/workspace init <git-url>`",
+		LangEnglish:            "Usage: `/workspace init <git-url or directory-path>`",
+		LangChinese:            "用法: `/workspace init <git仓库地址或目录路径>`",
+		LangTraditionalChinese: "用法: `/workspace init <git倉庫地址或目錄路徑>`",
+		LangJapanese:           "使い方: `/workspace init <git-urlまたはディレクトリパス>`",
+		LangSpanish:            "Uso: `/workspace init <git-url o ruta-de-directorio>`",
 	},
 	MsgWsBindUsage: {
 		LangEnglish:            "Usage: `/workspace bind <workspace-name>`",
@@ -3658,11 +4130,18 @@ var messages = map[MsgKey]map[Language]string{
 		LangSpanish:            "El workspace efectivo actual proviene de la capa shared. Usa `/workspace shared unbind` para quitarlo.",
 	},
 	MsgWsNotFoundHint: {
-		LangEnglish:            "No workspace found for this channel. Send me a git repo URL to clone, or use `/workspace init <url>`.",
-		LangChinese:            "此频道未找到工作区。请发送 git 仓库地址进行克隆，或使用 `/workspace init <仓库地址>`。",
-		LangTraditionalChinese: "此頻道未找到工作區。請發送 git 倉庫地址進行克隆，或使用 `/workspace init <倉庫地址>`。",
-		LangJapanese:           "このチャンネルにワークスペースが見つかりません。gitリポジトリURLを送信するか、`/workspace init <url>` を使用してください。",
-		LangSpanish:            "No se encontró workspace para este canal. Envía una URL de repo git para clonar, o usa `/workspace init <url>`.",
+		LangEnglish:            "No workspace found for this channel. Send a git repo URL, a local directory path, or use `/workspace init <url-or-path>`.",
+		LangChinese:            "此频道未找到工作区。请发送 git 仓库地址或本地目录路径，或使用 `/workspace init <仓库地址或目录路径>`。",
+		LangTraditionalChinese: "此頻道未找到工作區。請發送 git 倉庫地址或本地目錄路徑，或使用 `/workspace init <倉庫地址或目錄路徑>`。",
+		LangJapanese:           "このチャンネルにワークスペースが見つかりません。git URL またはローカルディレクトリパスを送信するか、`/workspace init <urlまたはパス>` を使用してください。",
+		LangSpanish:            "No se encontró workspace para este canal. Envía una URL de repo git, una ruta de directorio local, o usa `/workspace init <url-o-ruta>`.",
+	},
+	MsgWsNotFoundHintGitOnly: {
+		LangEnglish:            "No workspace found for this channel. Send a git repo URL or use `/workspace init <git-url>`.",
+		LangChinese:            "此频道未找到工作区。请发送 git 仓库地址，或使用 `/workspace init <git仓库地址>`。",
+		LangTraditionalChinese: "此頻道未找到工作區。請發送 git 倉庫地址，或使用 `/workspace init <git倉庫地址>`。",
+		LangJapanese:           "このチャンネルにワークスペースが見つかりません。git URL を送信するか、`/workspace init <git-url>` を使用してください。",
+		LangSpanish:            "No se encontró workspace para este canal. Envía una URL de repo git o usa `/workspace init <git-url>`.",
 	},
 	MsgWsResolutionError: {
 		LangEnglish:            "Workspace resolution error: %v",
@@ -3692,10 +4171,33 @@ var messages = map[MsgKey]map[Language]string{
 		LangJapanese:           "❌ リポジトリのクローンに失敗しました: %v",
 		LangSpanish:            "❌ Error al clonar repositorio: %v",
 	},
+	MsgWsInitDirNotFound: {
+		LangEnglish:            "Directory not found: `%s`. Please provide a valid directory path or a git URL.",
+		LangChinese:            "目录不存在: `%s`。请提供有效的目录路径或 git 仓库地址。",
+		LangTraditionalChinese: "目錄不存在: `%s`。請提供有效的目錄路徑或 git 倉庫地址。",
+		LangJapanese:           "ディレクトリが見つかりません: `%s`。有効なディレクトリパスまたは git URL を指定してください。",
+		LangSpanish:            "Directorio no encontrado: `%s`. Proporcione una ruta de directorio válida o una URL de git.",
+	},
+	MsgWsInitInvalidTarget: {
+		LangEnglish:            "Please provide a git URL (e.g. `https://github.com/org/repo`) or a local directory path.",
+		LangChinese:            "请提供 git 仓库地址（如 `https://github.com/org/repo`）或本地目录路径。",
+		LangTraditionalChinese: "請提供 git 倉庫地址（如 `https://github.com/org/repo`）或本地目錄路徑。",
+		LangJapanese:           "git URL（例: `https://github.com/org/repo`）またはローカルディレクトリパスを指定してください。",
+		LangSpanish:            "Proporcione una URL de git (ej. `https://github.com/org/repo`) o una ruta de directorio local.",
+	},
+	MsgWsInitLocalPathsDisabled: {
+		LangEnglish:            "Local directory targets are disabled for `/workspace init`. Use a git URL, or enable `workspace_init_allow_local_paths = true` for this project.",
+		LangChinese:            "`/workspace init` 未启用本地目录目标。请使用 git 仓库地址，或在此项目配置 `workspace_init_allow_local_paths = true`。",
+		LangTraditionalChinese: "`/workspace init` 未啟用本機目錄目標。請使用 git 倉庫地址，或在此專案配置 `workspace_init_allow_local_paths = true`。",
+		LangJapanese:           "`/workspace init` ではローカルディレクトリ対象が無効です。git URL を使うか、このプロジェクトで `workspace_init_allow_local_paths = true` を有効にしてください。",
+		LangSpanish:            "Los destinos de directorio local están deshabilitados para `/workspace init`. Use una URL de git o habilite `workspace_init_allow_local_paths = true` para este proyecto.",
+	},
 }
 
 func (i *I18n) T(key MsgKey) string {
+	i.mu.RLock()
 	lang := i.currentLang()
+	i.mu.RUnlock()
 	if msg, ok := messages[key]; ok {
 		if translated, ok := msg[lang]; ok {
 			return translated

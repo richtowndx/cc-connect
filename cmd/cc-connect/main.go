@@ -11,7 +11,6 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -29,6 +28,86 @@ var (
 	commit    = "none"
 	buildTime = "unknown"
 )
+
+// defaultResetOnIdleMins is applied when a project does not set
+// reset_on_idle_mins. After this many minutes of user inactivity, cc-connect
+// rotates to a fresh session for the next message instead of resuming the
+// previous transcript via --continue. This avoids "context drift" where stale
+// chat history (failed commands, debugging noise, abandoned tangents) is
+// repeatedly re-ingested and starts to dominate the model's attention. The
+// previous session is preserved and remains accessible via /list and /switch.
+//
+// Set reset_on_idle_mins = 0 in config.toml to opt out and restore the
+// previous behavior of always continuing the prior session.
+const defaultResetOnIdleMins = 0
+
+// resolveResetOnIdle returns the configured reset-on-idle duration for a
+// project, applying defaultResetOnIdleMins when the field is unset. The second
+// return value indicates whether the default was applied, so the caller can
+// emit a one-time nudge log directing users to the docs.
+func resolveResetOnIdle(configured *int) (time.Duration, bool) {
+	if configured != nil {
+		return time.Duration(*configured) * time.Minute, false
+	}
+	return time.Duration(defaultResetOnIdleMins) * time.Minute, true
+}
+
+// logSizeSource describes where the resolved log size came from, so the
+// caller can log it and operators can audit the active setting without
+// grepping systemd/launchd definitions.
+type logSizeSource string
+
+const (
+	logSizeSourceFlag    logSizeSource = "flag"
+	logSizeSourceEnv     logSizeSource = "env"
+	logSizeSourceDefault logSizeSource = "default"
+)
+
+// resolveLogMaxSize picks the effective max log size in bytes, applying the
+// priority order: explicit flag value > CC_LOG_MAX_SIZE env var > built-in
+// default. flagValue is the raw string from --log-max-size ("" if not set).
+// Returns the byte count and which source won. Invalid flag/env values are
+// logged to stderr and the value is ignored — a malformed setting must never
+// silently downgrade to "0 bytes" or another surprise.
+func resolveLogMaxSize(flagValue string) (int64, logSizeSource) {
+	if strings.TrimSpace(flagValue) != "" {
+		n, err := daemon.ParseLogSize(flagValue)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "warning: ignoring --log-max-size=%q: %v\n", flagValue, err)
+		} else {
+			return n, logSizeSourceFlag
+		}
+	}
+	if v := os.Getenv("CC_LOG_MAX_SIZE"); v != "" {
+		n, err := daemon.ParseLogSize(v)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "warning: ignoring CC_LOG_MAX_SIZE=%q: %v\n", v, err)
+		} else {
+			return n, logSizeSourceEnv
+		}
+	}
+	return int64(daemon.DefaultLogMaxSize), logSizeSourceDefault
+}
+
+// preScanLogMaxSizeFlag returns the value passed via --log-max-size before
+// flag.Parse() runs, so the rotating-writer setup can honour the flag too.
+// Returns "" if the flag is absent. Both "--log-max-size VALUE" and
+// "--log-max-size=VALUE" forms are recognised.
+func preScanLogMaxSizeFlag(args []string) string {
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if a == "--log-max-size" {
+			if i+1 < len(args) {
+				return args[i+1]
+			}
+			return ""
+		}
+		if strings.HasPrefix(a, "--log-max-size=") {
+			return strings.TrimPrefix(a, "--log-max-size=")
+		}
+	}
+	return ""
+}
 
 type initialModelRefreshStarter interface {
 	StartInitialModelRefresh()
@@ -67,11 +146,17 @@ func main() {
 		case "cron":
 			runCron(os.Args[2:])
 			return
+		case "timer", "at":
+			runTimer(os.Args[2:])
+			return
 		case "relay":
 			runRelay(os.Args[2:])
 			return
 		case "sessions":
 			runSessions(os.Args[2:])
+			return
+		case "agent-sid":
+			runAgentSID(os.Args[2:])
 			return
 		case "daemon":
 			runDaemon(os.Args[2:])
@@ -85,19 +170,22 @@ func main() {
 		case "doctor":
 			runDoctor(os.Args[2:])
 			return
+		case "web":
+			runWeb(os.Args[2:])
+			return
 		}
 	}
 
 	// When started as a daemon (CC_LOG_FILE set), redirect logs to a rotating file.
+	// Log file setup happens before flag.Parse() so the rotating writer is in
+	// place before any slog output. To still honour --log-max-size, we
+	// pre-scan os.Args here for the flag value; this is a small, deliberate
+	// duplication of flag parsing for one well-known key.
 	var logWriter io.Writer
 	var logCloser io.Closer
 	if logFile := os.Getenv("CC_LOG_FILE"); logFile != "" {
-		maxSize := int64(daemon.DefaultLogMaxSize)
-		if v := os.Getenv("CC_LOG_MAX_SIZE"); v != "" {
-			if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
-				maxSize = n
-			}
-		}
+		maxSize, maxSizeSrc := resolveLogMaxSize(preScanLogMaxSizeFlag(os.Args[1:]))
+		fmt.Fprintf(os.Stderr, "log: redirecting to %s with max_size=%d bytes (source: %s)\n", logFile, maxSize, maxSizeSrc)
 		w, err := daemon.NewRotatingWriter(logFile, maxSize)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "failed to open log file %s: %v\n", logFile, err)
@@ -113,8 +201,20 @@ func main() {
 	observeFlag := flag.Bool("observe", false, "observe native terminal Claude Code sessions and forward to Slack")
 	observeChannel := flag.String("observe-channel", "", "Slack channel ID to forward terminal observations to (requires --observe)")
 	forceFlag := flag.Bool("force", false, "kill any existing instance with the same config before starting")
+	logMaxSizeFlag := flag.String("log-max-size", "", "max bytes for the rotating log file (e.g. 10MB, 512K, 10485760); overrides CC_LOG_MAX_SIZE env var (default: 10MB)")
 	flag.Usage = printUsage
 	flag.Parse()
+
+	// Cross-check: the rotating-writer setup above consumed a pre-scanned
+	// value of --log-max-size, but flag.Parse() may have been called for
+	// tests or wrappers that pre-scan differently. Validate the parsed flag
+	// value here so the binding is exercised and a typo caught by
+	// flag.Parse() surfaces a clear error.
+	if strings.TrimSpace(*logMaxSizeFlag) != "" {
+		if _, err := daemon.ParseLogSize(*logMaxSizeFlag); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: --log-max-size=%q: %v\n", *logMaxSizeFlag, err)
+		}
+	}
 
 	if *showVersion {
 		fmt.Printf("cc-connect %s\ncommit:  %s\nbuilt:   %s\n", version, commit, buildTime)
@@ -123,6 +223,8 @@ func main() {
 
 	core.VersionInfo = fmt.Sprintf("cc-connect %s\ncommit: %s\nbuilt: %s", version, commit, buildTime)
 	core.CurrentVersion = version
+	core.CurrentCommit = commit
+	core.CurrentBuildTime = buildTime
 
 	configPath := resolveConfigPath(*configFlag)
 
@@ -160,6 +262,13 @@ func main() {
 
 	config.ConfigPath = configPath
 	slog.Info("config loaded", "path", configPath)
+
+	if len(cfg.Projects) == 0 {
+		fmt.Fprintf(os.Stderr, "Error: no projects configured in %s\n", configPath)
+		fmt.Fprintln(os.Stderr, "Add at least one [[project]] section to your config.toml, or run:")
+		fmt.Fprintln(os.Stderr, "  cc-connect init")
+		os.Exit(1)
+	}
 
 	setupLogger(cfg.Log.Level, logWriter)
 
@@ -236,14 +345,21 @@ func main() {
 		}
 
 		engine := core.NewEngine(proj.Name, agent, platforms, sessionFile, lang)
-		showCtx := true
-		if proj.ShowContextIndicator != nil {
-			showCtx = *proj.ShowContextIndicator
-		}
+		// Wire display settings including show_context_indicator and reply_footer
+		// Global [display] config can be overridden by project-level settings
+		_, _, _, _, _, showCtx, showFooter := config.EffectiveDisplay(cfg, &proj)
 		engine.SetShowContextIndicator(showCtx)
+		showWorkdir := true
+		if proj.ShowWorkdirIndicator != nil {
+			showWorkdir = *proj.ShowWorkdirIndicator
+		}
+		engine.SetShowWorkdirIndicator(showWorkdir)
+		engine.SetReplyFooterEnabled(showFooter)
 		engine.SetAttachmentSendEnabled(cfg.AttachmentSend != "off")
+		engine.SetFilterExternalSessions(proj.FilterExternalSessions != nil && *proj.FilterExternalSessions)
 		engine.SetBaseWorkDir(workDir)
 		engine.SetProjectStateStore(projectState)
+		engine.SetDataDir(cfg.DataDir)
 
 		// Wire multi-workspace mode
 		if proj.Mode == "multi-workspace" {
@@ -258,6 +374,26 @@ func main() {
 			}
 			bindingStore := filepath.Join(cfg.DataDir, "workspace_bindings.json")
 			engine.SetMultiWorkspace(baseDir, bindingStore)
+			if proj.WorkspaceInitAllowLocalPaths != nil {
+				engine.SetWorkspaceInitAllowLocalPaths(*proj.WorkspaceInitAllowLocalPaths)
+			}
+			idleMins := cfg.WorkspaceIdleTimeoutMins
+			if idleMins == nil && proj.WorkspaceIdleTimeoutMinsLegacy != nil {
+				slog.Warn("workspace_idle_timeout_mins under [[projects]] is deprecated; move it to the top level of config.toml. Honoring the legacy value for backwards compatibility.",
+					"project", proj.Name, "value", *proj.WorkspaceIdleTimeoutMinsLegacy)
+				idleMins = proj.WorkspaceIdleTimeoutMinsLegacy
+			}
+			if idleMins != nil {
+				mins := *idleMins
+				if mins <= 0 {
+					engine.SetWorkspaceIdleTimeout(0)
+				} else {
+					engine.SetWorkspaceIdleTimeout(time.Duration(mins) * time.Minute)
+				}
+			}
+			if proj.SkipGit != nil {
+				engine.SetSkipGit(*proj.SkipGit)
+			}
 			slog.Info("multi-workspace mode enabled", "project", proj.Name, "base_dir", baseDir)
 		}
 
@@ -341,13 +477,35 @@ func main() {
 
 		// Wire display truncation settings (includes legacy quiet → display mapping)
 		{
-			tm, tool, tmlen, toollen := config.EffectiveDisplay(cfg, &proj)
+			mode, tm, tool, tmlen, toollen, _, _ := config.EffectiveDisplay(cfg, &proj)
 			engine.SetDisplayConfig(core.DisplayCfg{
+				Mode:             mode,
+				CardMode:         config.EffectiveCardMode(cfg, &proj),
 				ThinkingMessages: tm,
 				ThinkingMaxLen:   tmlen,
 				ToolMaxLen:       toollen,
 				ToolMessages:     tool,
 			})
+		}
+
+		// Wire shell configuration
+		shell, shellFlag, shellProfile := config.EffectiveShell(cfg, &proj)
+		engine.SetShell(shell, shellFlag, shellProfile)
+
+		// Wire hooks
+		if len(cfg.Hooks) > 0 {
+			coreHooks := make([]core.HookConfig, len(cfg.Hooks))
+			for i, h := range cfg.Hooks {
+				coreHooks[i] = core.HookConfig{
+					Event:   h.Event,
+					Type:    h.Type,
+					Command: h.Command,
+					URL:     h.URL,
+					Timeout: h.Timeout,
+					Async:   h.Async,
+				}
+			}
+			engine.SetHooks(core.NewHookManager(proj.Name, coreHooks, shell, shellFlag, shellProfile))
 		}
 
 		// Wire local reference normalization / rendering
@@ -378,6 +536,14 @@ func main() {
 				spcfg.DisabledPlatforms = cfg.StreamPreview.DisabledPlatforms
 			}
 			engine.SetStreamPreviewCfg(spcfg)
+		}
+
+		// Wire instant reply
+		if cfg.InstantReply.Enabled != nil && *cfg.InstantReply.Enabled {
+			engine.SetInstantReply(core.InstantReplyCfg{
+				Enabled: true,
+				Content: cfg.InstantReply.Content,
+			})
 		}
 
 		// Wire rate limiting
@@ -425,8 +591,8 @@ func main() {
 			}
 		}
 
-		engine.SetDisplaySaveFunc(func(thinkingMessages *bool, thinkingMaxLen, toolMaxLen *int, toolMessages *bool) error {
-			return config.SaveDisplayConfig(thinkingMessages, thinkingMaxLen, toolMaxLen, toolMessages)
+		engine.SetDisplaySaveFunc(func(mode *string, thinkingMessages *bool, thinkingMaxLen, toolMaxLen *int, toolMessages *bool) error {
+			return config.SaveDisplayConfig(mode, thinkingMessages, thinkingMaxLen, toolMaxLen, toolMessages)
 		})
 
 		// Wire idle timeout
@@ -437,6 +603,16 @@ func main() {
 			} else {
 				engine.SetEventIdleTimeout(time.Duration(mins) * time.Minute)
 			}
+		}
+
+		// Wire max turn time (absolute per-turn wall-clock cap; 0 = disabled)
+		if cfg.MaxTurnTimeMins != nil && *cfg.MaxTurnTimeMins > 0 {
+			engine.SetMaxTurnTime(time.Duration(*cfg.MaxTurnTimeMins) * time.Minute)
+		}
+
+		// Wire queue depth
+		if cfg.Queue.MaxDepth != nil && *cfg.Queue.MaxDepth > 0 {
+			engine.SetMaxQueuedMessages(*cfg.Queue.MaxDepth)
 		}
 
 		// Wire auto-compress settings
@@ -451,8 +627,11 @@ func main() {
 			}
 			engine.SetAutoCompressConfig(true, maxTokens, minGap)
 		}
-		if proj.ResetOnIdleMins != nil {
-			engine.SetResetOnIdle(time.Duration(*proj.ResetOnIdleMins) * time.Minute)
+		resetIdle, defaulted := resolveResetOnIdle(proj.ResetOnIdleMins)
+		engine.SetResetOnIdle(resetIdle)
+		if defaulted {
+			slog.Info("project: reset_on_idle_mins not set, applying default — set reset_on_idle_mins = 0 to opt out, see docs/usage.md",
+				"project", proj.Name, "default_minutes", defaultResetOnIdleMins)
 		}
 
 		// Wire sender injection
@@ -512,13 +691,16 @@ func main() {
 		}
 
 		// Wire text-to-speech if enabled
-		if cfg.TTS.Enabled {
+		ttsEffective := config.ResolveTTSConfigForProject(cfg.TTS, proj.Name)
+		if ttsEffective.Enabled {
 			ttsCfg := &core.TTSCfg{
-				Enabled:    true,
-				Voice:      cfg.TTS.Voice,
-				MaxTextLen: cfg.TTS.MaxTextLen,
+				Enabled:      true,
+				Voice:        ttsEffective.Voice,
+				LanguageType: ttsEffective.LanguageType,
+				Speed:        ttsEffective.Speed,
+				MaxTextLen:   ttsEffective.MaxTextLen,
 			}
-			initMode := cfg.TTS.TTSMode
+			initMode := ttsEffective.TTSMode
 			switch initMode {
 			case "always", "voice_only":
 			case "":
@@ -528,7 +710,7 @@ func main() {
 				initMode = "voice_only"
 			}
 			ttsCfg.SetTTSMode(initMode)
-			switch cfg.TTS.Provider {
+			switch ttsEffective.Provider {
 			case "qwen":
 				apiKey := cfg.TTS.Qwen.APIKey
 				baseURL := cfg.TTS.Qwen.BaseURL
@@ -543,28 +725,53 @@ func main() {
 				apiKey := cfg.TTS.MiniMax.APIKey
 				baseURL := cfg.TTS.MiniMax.BaseURL
 				model := cfg.TTS.MiniMax.Model
+				if apiKey == "" {
+					localCfg, err := config.LoadMiniMaxLocalConfig(cfg.DataDir, cfg.TTS.MiniMax.ConfigFile)
+					if err != nil {
+						slog.Warn("tts: failed to load minimax local config", "error", err)
+					} else {
+						apiKey = localCfg.APIKey
+						if baseURL == "" {
+							if localCfg.BaseURL != "" {
+								baseURL = localCfg.BaseURL
+							} else if localCfg.APIHost != "" {
+								baseURL = localCfg.APIHost
+							}
+						}
+					}
+				}
 				if apiKey != "" {
 					ttsCfg.TTS = core.NewMiniMaxTTS(apiKey, baseURL, model, nil)
 					ttsCfg.Provider = "minimax"
 				} else {
 					slog.Warn("tts: minimax provider enabled but api_key is empty")
 				}
+			case "mimo":
+				apiKey := cfg.TTS.Mimo.APIKey
+				baseURL := cfg.TTS.Mimo.BaseURL
+				model := cfg.TTS.Mimo.Model
+				if apiKey != "" {
+					ttsCfg.TTS = core.NewMimoTTS(apiKey, baseURL, model, nil)
+					ttsCfg.Provider = "mimo"
+				} else {
+					slog.Warn("tts: mimo provider enabled but api_key is empty")
+				}
 			case "espeak":
-				voice := cfg.TTS.Voice
+				voice := ttsEffective.Voice
 				if voice == "" {
 					voice = "zh" // default to Chinese
 				}
 				ttsCfg.TTS = core.NewEspeakTTS("", voice)
 				ttsCfg.Provider = "espeak"
 			case "pico":
-				voice := cfg.TTS.Voice
+				voice := ttsEffective.Voice
 				if voice == "" {
 					voice = "zh-CN" // default to Chinese (Simplified)
 				}
 				ttsCfg.TTS = core.NewPicoTTS("", voice)
 				ttsCfg.Provider = "pico"
 			case "edge":
-				voice := cfg.TTS.Voice
+				voice := ttsEffective.Voice
 				if voice == "" {
 					voice = "zh-CN-XiaoxiaoNeural" // default Chinese neural voice
 				}
@@ -603,16 +810,39 @@ func main() {
 			return config.SaveActiveProvider(projName, providerName)
 		})
 		engine.SetProviderAddSaveFunc(func(p core.ProviderConfig) error {
-			return config.AddProviderToConfig(projName, config.ProviderConfig{
+			cp := config.ProviderConfig{
 				Name: p.Name, APIKey: p.APIKey, BaseURL: p.BaseURL,
 				Model: p.Model, Models: convertCoreModels(p.Models), Thinking: p.Thinking, Env: p.Env,
-			})
+			}
+			if p.CodexWireAPI != "" || len(p.CodexHTTPHeaders) > 0 {
+				cp.Codex = &config.CodexProviderConfig{
+					WireAPI: p.CodexWireAPI, HTTPHeaders: p.CodexHTTPHeaders,
+				}
+			}
+			return config.AddProviderToConfig(projName, cp)
 		})
 		engine.SetProviderRemoveSaveFunc(func(name string) error {
 			return config.RemoveProviderFromConfig(projName, name)
 		})
 		engine.SetProviderModelSaveFunc(func(providerName, model string) error {
 			return config.SaveProviderModel(projName, providerName, model)
+		})
+		engine.SetProviderRefsSaveFunc(func(refs []string) error {
+			return config.SaveProviderRefs(projName, refs)
+		})
+		engine.SetListGlobalProvidersFunc(func(agentType string) ([]core.ProviderConfig, error) {
+			globals, err := config.ListGlobalProviders()
+			if err != nil {
+				return nil, err
+			}
+			var result []core.ProviderConfig
+			for _, g := range globals {
+				if len(g.AgentTypes) > 0 && !containsString(g.AgentTypes, agentType) {
+					continue
+				}
+				result = append(result, configProviderToCore(g.ResolveForAgent(agentType)))
+			}
+			return result, nil
 		})
 		engine.SetModelSaveFunc(func(model string) error {
 			return config.SaveAgentModel(projName, model)
@@ -670,6 +900,26 @@ func main() {
 		}
 	}
 
+	// Start timer scheduler
+	timerStore, err := core.NewTimerStore(cfg.DataDir)
+	if err != nil {
+		slog.Warn("timer store unavailable", "error", err)
+	}
+	var timerSched *core.TimerScheduler
+	if timerStore != nil {
+		timerSched = core.NewTimerScheduler(timerStore)
+		if cfg.Cron.Silent != nil && *cfg.Cron.Silent {
+			timerSched.SetDefaultSilent(true)
+		}
+		if cfg.Cron.SessionMode != "" {
+			timerSched.SetDefaultSessionMode(cfg.Cron.SessionMode)
+		}
+		for i, e := range engines {
+			timerSched.RegisterEngine(cfg.Projects[i].Name, e)
+			e.SetTimerScheduler(timerSched)
+		}
+	}
+
 	// Start heartbeat scheduler
 	heartbeatSched := core.NewHeartbeatScheduler(cfg.DataDir)
 	for i, proj := range cfg.Projects {
@@ -699,6 +949,12 @@ func main() {
 		}
 	}
 
+	if timerSched != nil {
+		if err := timerSched.Start(); err != nil {
+			slog.Error("timer scheduler start failed", "error", err)
+		}
+	}
+
 	heartbeatSched.Start()
 
 	// Start bridge server if enabled
@@ -712,7 +968,17 @@ func main() {
 		if path == "" {
 			path = "/bridge/ws"
 		}
-		bridgeSrv = core.NewBridgeServer(port, cfg.Bridge.Token, path, cfg.Bridge.CORSOrigins)
+		// Check insecure flag for local development mode
+		insecure := cfg.Bridge.Insecure != nil && *cfg.Bridge.Insecure
+		if insecure {
+			bridgeSrv = core.NewBridgeServerInsecure(port, cfg.Bridge.Token, path, cfg.Bridge.CORSOrigins)
+		} else {
+			bridgeSrv = core.NewBridgeServer(port, cfg.Bridge.Token, path, cfg.Bridge.CORSOrigins)
+		}
+		if bridgeSrv == nil {
+			slog.Error("bridge: failed to create server - token is required (or set insecure=true for local dev)")
+			os.Exit(1)
+		}
 		for i, e := range engines {
 			bp := bridgeSrv.NewPlatform(cfg.Projects[i].Name)
 			bridgeSrv.RegisterEngine(cfg.Projects[i].Name, e, bp)
@@ -752,6 +1018,9 @@ func main() {
 		}
 		if cronSched != nil {
 			mgmtSrv.SetCronScheduler(cronSched)
+		}
+		if timerSched != nil {
+			mgmtSrv.SetTimerScheduler(timerSched)
 		}
 		mgmtSrv.SetHeartbeatScheduler(heartbeatSched)
 		if bridgeSrv != nil {
@@ -814,11 +1083,16 @@ func main() {
 				DisabledCommands:     u.DisabledCommands,
 				WorkDir:              u.WorkDir,
 				Mode:                 u.Mode,
+				AgentType:            u.AgentType,
 				ShowContextIndicator: u.ShowContextIndicator,
+				ShowWorkdirIndicator: u.ShowWorkdirIndicator,
+				ReplyFooter:          u.ReplyFooter,
+				InjectSender:         u.InjectSender,
 				PlatformAllowFrom:    u.PlatformAllowFrom,
 			})
 		})
 		mgmtSrv.SetGetProjectConfig(config.GetProjectConfigDetails)
+		mgmtSrv.SetSaveProviderRefs(config.SaveProviderRefs)
 		mgmtSrv.SetConfigFilePath(configPath)
 		mgmtSrv.SetGetGlobalSettings(config.GetGlobalSettings)
 		mgmtSrv.SetSaveGlobalSettings(func(updates map[string]any) error {
@@ -867,6 +1141,32 @@ func main() {
 			}
 			return config.SaveGlobalSettings(u)
 		})
+		mgmtSrv.SetListGlobalProviders(func() ([]core.GlobalProviderInfo, error) {
+			providers, err := config.ListGlobalProviders()
+			if err != nil {
+				return nil, err
+			}
+			out := make([]core.GlobalProviderInfo, len(providers))
+			for i, p := range providers {
+				out[i] = configProviderToGlobal(p)
+			}
+			return out, nil
+		})
+		mgmtSrv.SetAddGlobalProvider(func(info core.GlobalProviderInfo) error {
+			return config.AddGlobalProvider(globalProviderToConfig(info))
+		})
+		mgmtSrv.SetUpdateGlobalProvider(func(name string, info core.GlobalProviderInfo) error {
+			return config.UpdateGlobalProvider(name, globalProviderToConfig(info))
+		})
+		mgmtSrv.SetRemoveGlobalProvider(func(name string) error {
+			return config.RemoveGlobalProvider(name)
+		})
+		mgmtSrv.SetFetchPresets(core.FetchProviderPresets)
+		mgmtSrv.SetFetchSkillPresets(core.FetchSkillPresets)
+		if cfg.ProviderPresetsURL != "" {
+			core.SetPresetsURL(cfg.ProviderPresetsURL)
+		}
+		mgmtSrv.SetListCCSwitchProviders(listCCSwitchProvidersForWeb)
 		mgmtSrv.Start()
 	}
 
@@ -884,6 +1184,7 @@ func main() {
 				relayMgr.SetTimeout(time.Duration(secs) * time.Second)
 			}
 		}
+		relayMgr.SetVisibility(cfg.Relay.Visibility)
 		apiSrv.SetRelayManager(relayMgr)
 
 		// Create shared DirHistory for all engines
@@ -903,6 +1204,9 @@ func main() {
 		}
 		if cronSched != nil {
 			apiSrv.SetCronScheduler(cronSched)
+		}
+		if timerSched != nil {
+			apiSrv.SetTimerScheduler(timerSched)
 		}
 		apiSrv.Start()
 	}
@@ -939,6 +1243,9 @@ func main() {
 		webhookSrv.Stop()
 	}
 	heartbeatSched.Stop()
+	if timerSched != nil {
+		timerSched.Stop()
+	}
 	if cronSched != nil {
 		cronSched.Stop()
 	}
@@ -1168,7 +1475,7 @@ Flags:
   --help             Show this help message
 
 Commands:
-  daemon             Manage cc-connect as a background service (systemd/launchd)
+  daemon             Manage cc-connect as a background service (systemd/launchd/schtasks)
     install          Install and start the daemon service
     uninstall        Remove the daemon service
     start            Start the daemon
@@ -1183,11 +1490,14 @@ Commands:
   cron               Manage scheduled tasks
     add              Create a scheduled task (-c <expr> --prompt <text>)
     list             List scheduled tasks
+    exec             Trigger a scheduled task immediately
     del              Delete a scheduled task by ID
 
   sessions           Browse session history
     list             List all sessions (pipe-friendly)
     show <id>        Show session messages (-n N for last N)
+
+  agent-sid          Print the agent session ID for the current session
 
   relay              Cross-project message relay
     send             Send a message to another project and get the response
@@ -1276,14 +1586,25 @@ func reloadConfig(configPath, projName string, engine *core.Engine) (*core.Confi
 	}
 
 	// Reload display config (includes legacy quiet → display mapping)
-	tm, tool, tmlen, toollen := config.EffectiveDisplay(cfg, proj)
+	mode, tm, tool, tmlen, toollen, showCtx, showFooter := config.EffectiveDisplay(cfg, proj)
 	engine.SetDisplayConfig(core.DisplayCfg{
+		Mode:             mode,
+		CardMode:         config.EffectiveCardMode(cfg, proj),
 		ThinkingMessages: tm,
 		ThinkingMaxLen:   tmlen,
 		ToolMaxLen:       toollen,
 		ToolMessages:     tool,
 	})
 	result.DisplayUpdated = true
+
+	// Wire show_context_indicator and reply_footer from display config
+	engine.SetShowContextIndicator(showCtx)
+	showWorkdir := true
+	if proj.ShowWorkdirIndicator != nil {
+		showWorkdir = *proj.ShowWorkdirIndicator
+	}
+	engine.SetShowWorkdirIndicator(showWorkdir)
+	engine.SetReplyFooterEnabled(showFooter)
 
 	// Reload auto-compress settings
 	if proj.AutoCompress.Enabled != nil && *proj.AutoCompress.Enabled {
@@ -1299,17 +1620,22 @@ func reloadConfig(configPath, projName string, engine *core.Engine) (*core.Confi
 	} else {
 		engine.SetAutoCompressConfig(false, 0, 0)
 	}
-	if proj.ResetOnIdleMins != nil {
-		engine.SetResetOnIdle(time.Duration(*proj.ResetOnIdleMins) * time.Minute)
-	} else {
-		engine.SetResetOnIdle(0)
+	resetIdle, defaulted := resolveResetOnIdle(proj.ResetOnIdleMins)
+	engine.SetResetOnIdle(resetIdle)
+	if defaulted {
+		slog.Info("project: reset_on_idle_mins not set, applying default — set reset_on_idle_mins = 0 to opt out, see docs/usage.md",
+			"project", proj.Name, "default_minutes", defaultResetOnIdleMins)
 	}
 
-	showCtx := true
-	if proj.ShowContextIndicator != nil {
-		showCtx = *proj.ShowContextIndicator
+	// Reload instant reply
+	if cfg.InstantReply.Enabled != nil && *cfg.InstantReply.Enabled {
+		engine.SetInstantReply(core.InstantReplyCfg{
+			Enabled: true,
+			Content: cfg.InstantReply.Content,
+		})
+	} else {
+		engine.SetInstantReply(core.InstantReplyCfg{})
 	}
-	engine.SetShowContextIndicator(showCtx)
 
 	// Reload sender injection
 	engine.SetInjectSender(proj.InjectSender != nil && *proj.InjectSender)
@@ -1317,14 +1643,14 @@ func reloadConfig(configPath, projName string, engine *core.Engine) (*core.Confi
 	// Reload attachment send-back switch
 	engine.SetAttachmentSendEnabled(cfg.AttachmentSend != "off")
 
+	// Reload filter_external_sessions
+	engine.SetFilterExternalSessions(proj.FilterExternalSessions != nil && *proj.FilterExternalSessions)
+
 	// Reload providers
 	if ps, ok := engine.GetAgent().(core.ProviderSwitcher); ok {
 		providers := make([]core.ProviderConfig, len(proj.Agent.Providers))
 		for i, p := range proj.Agent.Providers {
-			providers[i] = core.ProviderConfig{
-				Name: p.Name, APIKey: p.APIKey, BaseURL: p.BaseURL,
-				Model: p.Model, Models: convertProviderModels(p.Models), Thinking: p.Thinking, Env: p.Env,
-			}
+			providers[i] = configProviderToCore(p)
 		}
 		ps.SetProviders(providers)
 		result.ProvidersUpdated = len(providers)
@@ -1400,6 +1726,19 @@ func buildUserRoleManager(uc *config.UsersConfig) *core.UserRoleManager {
 	return urm
 }
 
+func configProviderToCore(p config.ProviderConfig) core.ProviderConfig {
+	c := core.ProviderConfig{
+		Name: p.Name, APIKey: p.APIKey, BaseURL: p.BaseURL,
+		Model: p.Model, Models: convertProviderModels(p.Models),
+		Thinking: p.Thinking, Env: p.Env,
+	}
+	if p.Codex != nil {
+		c.CodexWireAPI = p.Codex.WireAPI
+		c.CodexHTTPHeaders = p.Codex.HTTPHeaders
+	}
+	return c
+}
+
 func convertProviderModels(ms []config.ProviderModelConfig) []core.ModelOption {
 	if len(ms) == 0 {
 		return nil
@@ -1433,15 +1772,7 @@ func wireAgentProviders(agent core.Agent, agentCfg config.AgentConfig) providerW
 
 	providers := make([]core.ProviderConfig, len(agentCfg.Providers))
 	for i, p := range agentCfg.Providers {
-		providers[i] = core.ProviderConfig{
-			Name:     p.Name,
-			APIKey:   p.APIKey,
-			BaseURL:  p.BaseURL,
-			Model:    p.Model,
-			Models:   convertProviderModels(p.Models),
-			Thinking: p.Thinking,
-			Env:      p.Env,
-		}
+		providers[i] = configProviderToCore(p)
 	}
 	ps.SetProviders(providers)
 	if result.explicitProviderRequested {
@@ -1458,6 +1789,77 @@ func startInitialRefreshIfReady(agent core.Agent, result providerWiringResult) {
 	if starter, ok := agent.(initialModelRefreshStarter); ok {
 		starter.StartInitialModelRefresh()
 	}
+}
+
+func configProviderToGlobal(p config.ProviderConfig) core.GlobalProviderInfo {
+	info := core.GlobalProviderInfo{
+		Name:        p.Name,
+		APIKey:      p.APIKey,
+		BaseURL:     p.BaseURL,
+		Model:       p.Model,
+		Thinking:    p.Thinking,
+		Env:         p.Env,
+		AgentTypes:  p.AgentTypes,
+		Endpoints:   p.Endpoints,
+		AgentModels: p.AgentModels,
+	}
+	for _, m := range p.Models {
+		info.Models = append(info.Models, struct {
+			Model string `json:"model"`
+			Alias string `json:"alias,omitempty"`
+		}{Model: m.Model, Alias: m.Alias})
+	}
+	if len(p.AgentModelLists) > 0 {
+		info.AgentModelLists = make(map[string][]core.GlobalModelEntry, len(p.AgentModelLists))
+		for at, ml := range p.AgentModelLists {
+			entries := make([]core.GlobalModelEntry, len(ml))
+			for i, m := range ml {
+				entries[i] = core.GlobalModelEntry{Model: m.Model, Alias: m.Alias}
+			}
+			info.AgentModelLists[at] = entries
+		}
+	}
+	if p.Codex != nil {
+		info.Codex = &core.GlobalCodexConfig{
+			WireAPI:     p.Codex.WireAPI,
+			HTTPHeaders: p.Codex.HTTPHeaders,
+		}
+	}
+	return info
+}
+
+func globalProviderToConfig(info core.GlobalProviderInfo) config.ProviderConfig {
+	p := config.ProviderConfig{
+		Name:        info.Name,
+		APIKey:      info.APIKey,
+		BaseURL:     info.BaseURL,
+		Model:       info.Model,
+		Thinking:    info.Thinking,
+		Env:         info.Env,
+		AgentTypes:  info.AgentTypes,
+		Endpoints:   info.Endpoints,
+		AgentModels: info.AgentModels,
+	}
+	for _, m := range info.Models {
+		p.Models = append(p.Models, config.ProviderModelConfig{Model: m.Model, Alias: m.Alias})
+	}
+	if len(info.AgentModelLists) > 0 {
+		p.AgentModelLists = make(map[string][]config.ProviderModelConfig, len(info.AgentModelLists))
+		for at, ml := range info.AgentModelLists {
+			entries := make([]config.ProviderModelConfig, len(ml))
+			for i, m := range ml {
+				entries[i] = config.ProviderModelConfig{Model: m.Model, Alias: m.Alias}
+			}
+			p.AgentModelLists[at] = entries
+		}
+	}
+	if info.Codex != nil {
+		p.Codex = &config.CodexProviderConfig{
+			WireAPI:     info.Codex.WireAPI,
+			HTTPHeaders: info.Codex.HTTPHeaders,
+		}
+	}
+	return p
 }
 
 func convertCoreModels(ms []core.ModelOption) []config.ProviderModelConfig {

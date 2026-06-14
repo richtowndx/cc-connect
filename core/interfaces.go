@@ -3,6 +3,7 @@ package core
 import (
 	"context"
 	"errors"
+	"time"
 )
 
 // Platform abstracts a messaging platform (Feishu, DingTalk, Slack, etc.).
@@ -22,6 +23,12 @@ var ErrNotSupported = errors.New("operation not supported by this platform")
 // to send messages to users without an incoming message.
 type ReplyContextReconstructor interface {
 	ReconstructReplyCtx(sessionKey string) (any, error)
+}
+
+// MessageRecallDetector is an optional interface for platforms that can check
+// whether the message targeted by a reply context was recalled/deleted.
+type MessageRecallDetector interface {
+	IsMessageRecalled(ctx context.Context, replyCtx any) (bool, error)
 }
 
 // CronReplyTargetResolver is an optional interface for platforms that need to
@@ -60,20 +67,28 @@ type PlatformPromptInjector interface {
 // The prompt is designed to be appended to the agent's existing system prompt.
 func AgentSystemPrompt() string {
 	return `You are running inside cc-connect, a bridge that connects you to messaging platforms.
-Your normal text responses are automatically delivered to the user — just reply normally; do NOT use cc-connect send for ordinary text replies.
+Your normal text responses are automatically delivered to the user — just reply normally, do NOT use cc-connect send for ordinary text replies.
 
-## Send generated images or files back to the user
+## Available tools
+
+### Send generated images, files, or voice messages back to the user
 When you generate a local image or file that should be sent to the user, use:
 
   cc-connect send --image /absolute/path/to/image.png
   cc-connect send --file /absolute/path/to/report.pdf
   cc-connect send --file /absolute/path/to/report.pdf --image /absolute/path/to/chart.png
 
-You may repeat --image / --file multiple times.
+You may repeat --image / --file multiple times. Use this only for generated attachments that need to be delivered to the user.
 If you include --message, do not repeat the exact same sentence again in your normal reply, because your normal reply is also delivered automatically.
 
-## Scheduled tasks (cron)
-When the user asks you to do something on a schedule, use the Bash tool to run:
+When the user explicitly asks you to send a voice/audio reply, synthesize and send it with:
+
+  cc-connect send --tts "text to speak"
+
+After this command succeeds, reply only with NO_REPLY unless the user also asked for a visible text confirmation. This prevents sending an extra text message after the voice message.
+
+### Scheduled tasks (cron)
+When the user asks you to do something on a schedule (e.g. "每天早上6点帮我总结GitHub trending"), use the Bash tool to run:
 
   cc-connect cron add --cron "<min> <hour> <day> <month> <weekday>" --prompt "<task description>" --desc "<short label>"
 
@@ -83,28 +98,91 @@ Optional flags:
   --session-mode <mode>     reuse (default) or new-per-run (fresh session each trigger)
   --timeout-mins <n>        max wait per run in minutes (default 30, 0 = unlimited)
   --exec <command>          run a shell command directly instead of --prompt
+
+Examples:
+  cc-connect cron add --cron "0 6 * * *" --prompt "Collect GitHub trending repos and send a summary" --desc "Daily GitHub Trending"
+  cc-connect cron add --cron "0 9 * * 1" --prompt "Generate a weekly project status report" --desc "Weekly Report"
+  cc-connect cron add --cron "*/2 * * * *" --exec "ipconfig" --session-mode new-per-run --desc "Every 2 min ipconfig"
+
+You can also list, inspect, run, edit, or delete cron jobs:
+  cc-connect cron list
+  cc-connect cron info <job-id> [field]
+  cc-connect cron exec <job-id>
+  cc-connect cron edit <job-id> <field> <value>
+  cc-connect cron del <job-id>
+
+When changing an existing job, first run ` + "`cc-connect cron info <job-id>`" + ` to inspect the current values, then use ` + "`cron edit`" + ` for only the field(s) the user asked to change.
+Use ` + "`cron exec <job-id>`" + ` to run an existing scheduled task immediately; this is different from the ` + "`--exec <command>`" + ` flag used when creating a shell-command cron job.
+Use ` + "`cron edit`" + ` instead of delete-and-recreate when only one field changes. Do not delete and recreate a job unless the user explicitly asks to replace it.
+Common editable fields:
+  cron_expr     new schedule, e.g. "0 9 * * *"
+  prompt        new task prompt (or ` + "`exec`" + ` for shell command)
+  description   short label
+  enabled       true / false  (pause without deleting)
+  mute          true / false  (silence all messages)
+  timeout_mins  integer minutes (0 = unlimited)
+Run ` + "`cc-connect cron edit --help`" + ` for the full field list.
+
+Examples:
+  cc-connect cron exec abc123
+  cc-connect cron edit abc123 cron_expr "0 9 * * *"
+  cc-connect cron edit abc123 enabled false
+  cc-connect cron edit abc123 prompt "Updated daily summary task"
+
+### One-shot timers (timer)
+When the user asks you to do something after a delay (e.g. "两小时后帮我检查PR"),
+use the Bash tool to run:
+
+  cc-connect timer add --delay <duration> --prompt "<task description>"
+
+Duration examples: 30m, 2h, 1h30m. Or use absolute time: --at "2026-05-16T09:00"
+Absolute times without timezone (e.g. "2026-05-16T09:00") are interpreted as the
+system's local timezone. When the user says "明天早上9点", use local time.
+Environment variables CC_PROJECT and CC_SESSION_KEY are already set.
+
+Optional flags:
+  --exec <command>          run a shell command directly instead of --prompt
+  --desc <text>             short description
+  --session-mode <mode>     reuse (default) or new-per-run (fresh session each run)
+  --timeout-mins <n>        max wait per run in minutes (default 30, 0 = unlimited)
+  --mute                    suppress all messages (start notification + result)
+
+Examples:
+  cc-connect timer add --delay 2h --prompt "Check PR status" --desc "PR check"
+  cc-connect timer add --delay 30m --exec "df -h" --desc "Disk check"
+  cc-connect timer add --at "2026-05-16T09:00" --prompt "Morning standup reminder"
+
+You can also list or cancel timers:
+  cc-connect timer list
+  cc-connect timer del <timer-id>
+
+### Bot-to-bot relay
+When you need to communicate with another bot (e.g. ask another AI agent a question), use:
+
+  cc-connect relay send --to <target_project> "<message>"
+
+IMPORTANT: <target_project> must be the EXACT project name from the /bind command output.
+Do NOT guess or modify the name — use it exactly as shown (e.g. "gemini", not "gemini-bot").
+
+This sends a message to the target bot and waits for its response (printed to stdout).
+The conversation is visible in the group chat and each bot maintains its own relay session.
+
+Environment variables CC_PROJECT and CC_SESSION_KEY are already set, so the relay knows which group chat to use.
+
+### Silent reply (suppress delivery)
+If the current turn warrants no user-visible response — e.g. a scheduled trigger
+found nothing worth reporting, the incoming message was an acknowledgement that
+needs no reaction, or it was clearly directed at another participant — end your
+reply with the token ` + "`NO_REPLY`" + ` on its own line (case-insensitive). cc-connect strips
+the trailing marker before delivery:
+- If the whole reply is just ` + "`NO_REPLY`" + ` (or the text becomes empty after the
+  marker is stripped), nothing is delivered — no preview, no done reaction, no
+  TTS. Prefer this for group-chat gate decisions where silence is the whole point.
+- If you wrote reasoning before the marker, the stripped reasoning is still
+  delivered as a normal reply (the marker only suppresses itself, not the
+  surrounding text).
+Use this sparingly; when in doubt, send a brief reply instead.
 `
-	//   cc-connect cron add --cron "0 6 * * *" --prompt "Collect GitHub trending repos and send a summary" --desc "Daily GitHub Trending"
-	//   cc-connect cron add --cron "0 9 * * 1" --prompt "Generate a weekly project status report" --desc "Weekly Report"
-	//   cc-connect cron add --cron "*/2 * * * *" --exec "ipconfig" --session-mode new-per-run --desc "Every 2 min ipconfig"
-
-	// You can also list or delete cron jobs:
-	//   cc-connect cron list
-	//   cc-connect cron del <job-id>
-
-	// ### Bot-to-bot relay
-	// When you need to communicate with another bot (e.g. ask another AI agent a question), use:
-
-	//   cc-connect relay send --to <target_project> "<message>"
-
-	// IMPORTANT: <target_project> must be the EXACT project name from the /bind command output.
-	// Do NOT guess or modify the name — use it exactly as shown (e.g. "gemini", not "gemini-bot").
-
-	// This sends a message to the target bot and waits for its response (printed to stdout).
-	// The conversation is visible in the group chat and each bot maintains its own relay session.
-
-	// Environment variables CC_PROJECT and CC_SESSION_KEY are already set, so the relay knows which group chat to use.
-	// `
 }
 
 // SystemPromptSupporter is an optional marker interface for agents that
@@ -115,12 +193,43 @@ type SystemPromptSupporter interface {
 	HasSystemPromptSupport() bool
 }
 
+// SessionIDValidator is an optional interface for agents that can validate
+// whether a stored session ID actually belongs to the current project's
+// session store. The engine uses this to prevent cross-project session
+// context leakage (issue #599): a stale ID from another project's workspace
+// would otherwise resume the wrong conversation history.
+//
+// Implementations should return false when:
+//   - the session ID is empty
+//   - the session file does not exist under the agent's per-project store
+//   - the agent cannot determine the current project directory
+//
+// The engine treats a false return as "clear the stored ID and start fresh".
+type SessionIDValidator interface {
+	ValidateSessionID(ctx context.Context, sessionID string) bool
+}
+
 // TypingIndicator is an optional interface for platforms that can show a
 // "processing" indicator (typing bubble, emoji reaction, etc.) while the
 // agent is working. StartTyping is called when processing begins and returns
 // a stop function that the caller must invoke when processing ends.
 type TypingIndicator interface {
 	StartTyping(ctx context.Context, replyCtx any) (stop func())
+}
+
+// TypingIndicatorDone is an optional interface for platforms that can show a
+// "done" reaction after processing completes. The engine calls AddDoneReaction
+// when the agent finishes a multi-round turn in quiet mode, so the user gets
+// a push notification (e.g. Feishu card edits don't trigger pushes).
+type TypingIndicatorDone interface {
+	AddDoneReaction(replyCtx any)
+}
+
+// AtMentionSender is an optional interface for platforms that support @mention in
+// reply messages (e.g. DingTalk). Platforms that implement this interface can
+// include @user notifications when replying in group chats.
+type AtMentionSender interface {
+	ReplyWithAt(ctx context.Context, replyCtx any, content string, atUsers []string, atAll bool) error
 }
 
 // ImageSender is an optional interface for platforms that support sending images.
@@ -138,6 +247,22 @@ type MessageUpdater interface {
 	UpdateMessage(ctx context.Context, replyCtx any, content string) error
 }
 
+// StatusFooterSender is an optional Platform extension for sending a reply
+// with a structured per-turn status footer rendered using platform-specific
+// dim/small styling (e.g. Lark `text_size: "notation"`). Platforms that do
+// not implement it fall back to receiving the footer appended inline to the
+// content via Send/SendWithButtons/...
+type StatusFooterSender interface {
+	SendWithStatusFooter(ctx context.Context, replyCtx any, content, footer string) error
+}
+
+// StatusFooterUpdater is the streaming-preview counterpart of
+// StatusFooterSender: it patches an existing preview message with a final
+// content + structured status footer block.
+type StatusFooterUpdater interface {
+	UpdateMessageWithStatusFooter(ctx context.Context, replyCtx any, content, footer string) error
+}
+
 // ProgressStyleProvider is an optional interface for platforms that expose
 // a preferred style for intermediate progress rendering.
 // Typical values: "legacy", "compact", "card".
@@ -149,6 +274,12 @@ type ProgressStyleProvider interface {
 // parse and render structured progress-card payloads.
 type ProgressCardPayloadSupport interface {
 	SupportsProgressCardPayload() bool
+}
+
+// ProgressUpdateThrottler is an optional interface for platforms that need
+// rate-limited progress edits (e.g. Discord's ~5 edits / 5s per channel).
+type ProgressUpdateThrottler interface {
+	ProgressUpdateInterval() time.Duration
 }
 
 // ButtonOption represents a clickable inline button.
@@ -181,6 +312,16 @@ type CardNavigationHandler func(action string, sessionKey string) *Card
 // card navigation (updating the existing card instead of sending a new message).
 type CardNavigable interface {
 	SetCardNavigationHandler(h CardNavigationHandler)
+}
+
+// CardRefresher is an optional interface for platforms that can update a
+// previously rendered card in-place after the original callback has returned.
+// This is used when async operations (e.g. delete-mode deletion) need to
+// refresh a "loading" card with the final result. Platforms that implement
+// this interface should track the message ID from card action callbacks and
+// use it to patch the card content.
+type CardRefresher interface {
+	RefreshCard(ctx context.Context, sessionKey string, card *Card) error
 }
 
 // PlatformLifecycleHandler receives readiness state transitions from async
@@ -262,6 +403,9 @@ type ProviderConfig struct {
 	Models   []ModelOption     // pre-configured list of available models for this provider
 	Thinking string            // override thinking type sent to this provider ("disabled", "enabled", or "" for no rewrite)
 	Env      map[string]string // arbitrary extra env vars (e.g. CLAUDE_CODE_USE_BEDROCK=1)
+	// Codex-specific provider config (maps to Codex model_providers.<name>)
+	CodexWireAPI     string            // wire API format (e.g. "responses")
+	CodexHTTPHeaders map[string]string // custom HTTP headers
 }
 
 // ProviderSwitcher is an optional interface for agents that support multiple API providers.
@@ -346,6 +490,30 @@ type UsageCredits struct {
 	Balance    string
 }
 
+// ContextUsageReporter is an optional interface for running agent sessions that
+// can report real runtime context usage for the active conversation.
+type ContextUsageReporter interface {
+	GetContextUsage() *ContextUsage
+}
+
+// ContextUsage describes runtime context consumption for the active session.
+type ContextUsage struct {
+	// UsedTokens is the current token load to compare against ContextWindow when
+	// computing remaining context capacity for the next turn.
+	UsedTokens int
+	// BaselineTokens is the portion of the context window always occupied by
+	// fixed runtime/system instructions and therefore excluded from user-visible
+	// "left" calculations when the agent provides it.
+	BaselineTokens           int
+	TotalTokens              int
+	InputTokens              int
+	CachedInputTokens        int // cache-read tokens (prior context retrieved from cache)
+	CacheCreationInputTokens int // cache-write tokens (new content written to cache)
+	OutputTokens             int
+	ReasoningOutputTokens    int
+	ContextWindow            int
+}
+
 // ContextCompressor is an optional interface for agents that support
 // compressing/compacting the conversation context within a running session.
 // CompressCommand returns the native slash command (e.g. "/compact", "/compress")
@@ -374,12 +542,27 @@ type SessionDeleter interface {
 	DeleteSession(ctx context.Context, sessionID string) error
 }
 
+type SessionTitleProvider interface {
+	GetSessionTitle(sessionID string) string
+}
+
 // WorkDirSwitcher is an optional interface for agents that support runtime
 // work directory switching. The change takes effect on the next session start;
 // the current running session is terminated automatically by the engine.
 type WorkDirSwitcher interface {
 	SetWorkDir(dir string)
 	GetWorkDir() string
+}
+
+// AgentOptsProvider is an optional interface for agents that need to carry
+// their full configuration options when the engine clones a per-workspace
+// agent instance in multi-workspace mode. The engine merges the returned map
+// into the workspace opts before calling the agent factory, giving workspace
+// agents access to agent-specific options (e.g. "session" for the tmux agent)
+// that are not covered by the standard GetModel / GetMode accessors.
+// work_dir is always overridden by the engine and must not be returned here.
+type AgentOptsProvider interface {
+	BaseOpts() map[string]any
 }
 
 // ModeSwitcher is an optional interface for agents that support runtime permission mode switching.
@@ -389,10 +572,28 @@ type ModeSwitcher interface {
 	PermissionModes() []PermissionModeInfo
 }
 
+// WorkspaceAgentOptionSnapshotter is an optional interface for agents that can
+// export reusable constructor options needed to recreate an equivalent agent in
+// a different workspace. Snapshot values should omit work_dir; the caller is
+// responsible for setting the target workspace explicitly. Provider wiring and
+// run_as propagation may still be handled separately by the engine.
+type WorkspaceAgentOptionSnapshotter interface {
+	WorkspaceAgentOptions() map[string]any
+}
+
 // LiveModeSwitcher is an optional interface for running agent sessions that can
 // apply a mode change immediately without restarting the process.
 type LiveModeSwitcher interface {
 	SetLiveMode(mode string) bool
+}
+
+// StartupWarner is an optional interface for agent sessions that need to surface
+// a one-time warning to the IM user at session start (e.g. when a requested
+// permission mode was silently downgraded due to OS constraints). The engine
+// sends the returned message to the IM platform immediately after starting the
+// session. Returns empty string when no warning is needed.
+type StartupWarner interface {
+	StartupWarning() string
 }
 
 // PermissionModeInfo describes a permission mode for display.
@@ -408,6 +609,7 @@ type PermissionModeInfo struct {
 type BotCommandInfo struct {
 	Command     string // command name without leading "/"
 	Description string // short description for the menu
+	IsSkill     bool   // whether this entry comes from a skill
 }
 
 // CommandRegistrar is an optional interface for platforms that support
@@ -420,4 +622,42 @@ type CommandRegistrar interface {
 // channel IDs to human-readable names.
 type ChannelNameResolver interface {
 	ResolveChannelName(channelID string) (string, error)
+}
+
+// StreamingCard represents an active streaming card that aggregates
+// an entire agent turn (tool calls, thinking, text) into a single
+// updatable message.
+type StreamingCard interface {
+	// Update replaces the card content with the given markdown.
+	// Implementations should throttle calls internally.
+	Update(ctx context.Context, content string) error
+	// Finalize sends the final content and marks the card as complete.
+	Finalize(ctx context.Context, content string) error
+	// Failed returns true if the card has entered a failed state.
+	Failed() bool
+}
+
+// StreamingCardPlatform is an optional interface for platforms that support
+// aggregating an entire agent turn into a single updatable card message
+// (e.g. DingTalk AI Card). When the engine detects this interface, it
+// creates a streaming card at the start of each turn and routes all
+// events through it instead of sending individual messages.
+type StreamingCardPlatform interface {
+	CreateStreamingCard(ctx context.Context, replyCtx any) (StreamingCard, error)
+}
+
+// CardStatus represents the visual status of a card header.
+type CardStatus string
+
+const (
+	CardStatusThinking CardStatus = "thinking" // grey
+	CardStatusWorking  CardStatus = "working"  // blue
+	CardStatusDone     CardStatus = "done"     // green
+	CardStatusError    CardStatus = "error"    // red
+)
+
+// PreviewStatusUpdater is an optional interface for platforms that support
+// updating the visual status of a preview card header.
+type PreviewStatusUpdater interface {
+	SetPreviewStatus(previewHandle any, status CardStatus)
 }

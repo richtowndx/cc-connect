@@ -29,7 +29,7 @@ func runDaemon(args []string) {
 	case "stop":
 		daemonStop()
 	case "restart":
-		daemonRestart()
+		daemonRestart(args[1:])
 	case "status":
 		daemonStatus()
 	case "logs":
@@ -103,17 +103,38 @@ func daemonInstall(args []string) {
 	fmt.Println("  cc-connect daemon restart   - Restart")
 	fmt.Println("  cc-connect daemon stop      - Stop")
 	fmt.Println("  cc-connect daemon uninstall - Remove")
+
+	// Check linger for user-mode systemd
+	if strings.Contains(mgr.Platform(), "user") {
+		enabled, user := daemon.CheckLinger()
+		if !enabled {
+			fmt.Println()
+			fmt.Println("⚠️  Warning: Linger is not enabled for this user.")
+			fmt.Println("   cc-connect will stop when your last login session ends (e.g., SSH disconnect).")
+			fmt.Println("   To keep it running persistently, run:")
+			fmt.Printf("     sudo loginctl enable-linger %s\n", user)
+		}
+	}
 }
 
 func parseDaemonInstallArgs(args []string) (daemon.Config, bool, error) {
 	var cfg daemon.Config
 	var force bool
 
+	// Env-based opt-out: CC_DAEMON_NO_CAPTURE_SECRETS=1 / true / yes / on
+	// triggers --no-capture-secrets without the CLI flag, for CI / container
+	// scenarios where the global env is the right configuration surface.
+	if isTruthyEnv(os.Getenv("CC_DAEMON_NO_CAPTURE_SECRETS")) {
+		cfg.NoCaptureSecrets = true
+	}
+
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
 		switch {
 		case arg == "--force":
 			force = true
+		case arg == "--no-capture-secrets":
+			cfg.NoCaptureSecrets = true
 		case arg == "--log-file":
 			value, next, err := daemonInstallFlagValue(args, i, "--log-file")
 			if err != nil {
@@ -177,6 +198,16 @@ func daemonInstallFlagValue(args []string, index int, flagName string) (string, 
 	return args[next], next, nil
 }
 
+// isTruthyEnv accepts the conventional opt-in values for boolean env vars.
+// Anything else, including "0" / "false" / "" / unset, is treated as false.
+func isTruthyEnv(v string) bool {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "1", "true", "yes", "on":
+		return true
+	}
+	return false
+}
+
 // ── uninstall ───────────────────────────────────────────────
 
 func daemonUninstall() {
@@ -223,9 +254,24 @@ func daemonStop() {
 	fmt.Println("cc-connect daemon stopped.")
 }
 
-func daemonRestart() {
+func daemonRestart(args []string) {
+	force := false
+	for _, a := range args {
+		if a == "--force" {
+			force = true
+		}
+	}
+
 	mgr := mustManager()
 	requireInstalled(mgr)
+
+	if force {
+		if meta, err := daemon.LoadMeta(); err == nil {
+			configPath := meta.WorkDir + "/config.toml"
+			KillExistingInstance(configPath)
+		}
+	}
+
 	if err := mgr.Restart(); err != nil {
 		fmt.Fprintf(os.Stderr, "Restart failed: %v\n", err)
 		os.Exit(1)
@@ -404,6 +450,12 @@ Install flags:
   --log-max-size N      Max log file size in MB (default: 10)
   --work-dir DIR        Directory containing config.toml (default: current dir)
   --force               Overwrite existing installation
+  --no-capture-secrets  Do not capture config.toml ${ENV} placeholders into
+                        the service file. Also enabled by setting
+                        CC_DAEMON_NO_CAPTURE_SECRETS=1 in the environment.
+
+Restart flags:
+  --force               Kill existing process before restarting
 
 Logs flags:
   -f, --follow          Follow log output (like tail -f)
@@ -413,5 +465,6 @@ Logs flags:
 Supported platforms:
   Linux (root)     - systemd system service (/etc/systemd/system/)
   Linux (non-root) - systemd user service (~/.config/systemd/user/)
-  macOS            - launchd LaunchAgent`)
+  macOS            - launchd LaunchAgent
+  Windows          - Task Scheduler task (schtasks)`)
 }
